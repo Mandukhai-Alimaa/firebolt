@@ -1,8 +1,9 @@
 #include "HttpClient.h"
+#include "FireboltAdbcConnection.h"
 #include "FireboltAdbcDatabase.h"
+#include "HttpHeaderParse.h"
 
 #include <cstring>
-#include <sstream>
 #include <stdexcept>
 
 #include <curl/curl.h>
@@ -12,81 +13,6 @@ namespace firebolt::adbc
 
 namespace
 {
-
-    std::vector<std::string> extractHeaderValues(const std::string & headers, const std::string & header_name)
-    {
-        std::vector<std::string> result;
-        const std::string prefix = header_name + ":";
-        size_t pos = 0;
-        while (true)
-        {
-            size_t found = headers.find(prefix, pos);
-            if (found == std::string::npos)
-                break;
-            size_t val_start = found + prefix.size();
-            size_t val_end = headers.find('\n', val_start);
-            if (val_end == std::string::npos)
-                val_end = headers.size();
-            std::string val = headers.substr(val_start, val_end - val_start);
-            val.erase(0, val.find_first_not_of(" \t\r"));
-            val.erase(val.find_last_not_of(" \t\r") + 1);
-            if (!val.empty())
-                result.push_back(val);
-            pos = val_end;
-        }
-        return result;
-    }
-
-    std::unordered_map<std::string, std::string> parseUpdateParameters(const std::string & headers)
-    {
-        std::unordered_map<std::string, std::string> params;
-        for (const auto & hval : extractHeaderValues(headers, "Firebolt-Update-Parameters"))
-        {
-            std::stringstream ss(hval);
-            std::string pair;
-            while (std::getline(ss, pair, ','))
-            {
-                pair.erase(0, pair.find_first_not_of(" \t"));
-                pair.erase(pair.find_last_not_of(" \t") + 1);
-                size_t eq = pair.find('=');
-                if (eq != std::string::npos)
-                {
-                    std::string key = pair.substr(0, eq);
-                    std::string val = pair.substr(eq + 1);
-                    key.erase(0, key.find_first_not_of(" \t"));
-                    key.erase(key.find_last_not_of(" \t") + 1);
-                    val.erase(0, val.find_first_not_of(" \t"));
-                    val.erase(val.find_last_not_of(" \t") + 1);
-                    if (!key.empty())
-                        params[key] = val;
-                }
-            }
-        }
-        return params;
-    }
-
-    std::vector<std::string> parseRemoveParameters(const std::string & headers)
-    {
-        std::vector<std::string> params;
-        for (const auto & hval : extractHeaderValues(headers, "Firebolt-Remove-Parameters"))
-        {
-            std::stringstream ss(hval);
-            std::string name;
-            while (std::getline(ss, name, ','))
-            {
-                name.erase(0, name.find_first_not_of(" \t"));
-                name.erase(name.find_last_not_of(" \t") + 1);
-                if (!name.empty())
-                    params.push_back(name);
-            }
-        }
-        return params;
-    }
-
-    bool shouldResetSession(const std::string & headers)
-    {
-        return !extractHeaderValues(headers, "Firebolt-Reset-Session").empty();
-    }
 
     std::string urlEncode(CURL * handle, const std::string & s)
     {
@@ -99,7 +25,7 @@ namespace
 
 } // namespace
 
-HttpClient::HttpClient(const FireboltDatabase & db) : db_(db)
+HttpClient::HttpClient(const FireboltConnection & conn) : fb_conn_(conn)
 {
     handle_ = curl_easy_init();
     if (!handle_)
@@ -120,19 +46,11 @@ size_t HttpClient::writeBodyCallback(char * ptr, size_t size, size_t nmemb, void
     return total;
 }
 
-size_t HttpClient::writeHeaderCallback(char * ptr, size_t size, size_t nmemb, void * userdata)
-{
-    auto * headers = static_cast<std::string *>(userdata);
-    const size_t total = size * nmemb;
-    headers->append(ptr, total);
-    return total;
-}
-
 std::string HttpClient::buildUrl(const std::unordered_map<std::string, std::string> & session_params) const
 {
     // Use the endpoint URL verbatim — do not append a trailing slash so that
     // paths specified by the user (e.g. "http://host/query") are preserved.
-    std::string url = db_.url;
+    std::string url = fb_conn_.db->url;
 
     bool first = (url.find('?') == std::string::npos);
     auto addParam = [&](const std::string & k, const std::string & v) {
@@ -141,8 +59,8 @@ std::string HttpClient::buildUrl(const std::unordered_map<std::string, std::stri
         url += k + "=" + urlEncode(handle_, v);
     };
 
-    if (!db_.database.empty())
-        addParam("database", db_.database);
+    if (!fb_conn_.db->database.empty())
+        addParam("database", fb_conn_.db->database);
 
     for (const auto & [k, v] : session_params)
         addParam(k, v);
@@ -153,9 +71,9 @@ std::string HttpClient::buildUrl(const std::unordered_map<std::string, std::stri
 curl_slist * HttpClient::buildAuthHeader() const
 {
     curl_slist * headers = nullptr;
-    if (!db_.token.empty())
+    if (!fb_conn_.token.empty())
     {
-        std::string auth = "Authorization: Bearer " + db_.token;
+        std::string auth = "Authorization: Bearer " + fb_conn_.token;
         headers = curl_slist_append(headers, auth.c_str());
     }
     headers = curl_slist_append(headers, "Firebolt-Protocol-Version: 2.4");
@@ -164,20 +82,13 @@ curl_slist * HttpClient::buildAuthHeader() const
 
 void HttpClient::parseResponseHeaders(HttpResponse & resp) const
 {
-    if (shouldResetSession(raw_headers_))
-        resp.reset_session = true;
-    resp.update_params = parseUpdateParameters(raw_headers_);
-    resp.remove_params = parseRemoveParameters(raw_headers_);
-}
-
-void HttpClient::resetResponseState()
-{
-    raw_headers_.clear();
+    resp.reset_session = shouldResetSession(handle_);
+    resp.update_params = parseUpdateParameters(handle_);
+    resp.remove_params = parseRemoveParameters(handle_);
 }
 
 HttpResponse HttpClient::executeQuery(const std::string & sql, const std::unordered_map<std::string, std::string> & session_params)
 {
-    resetResponseState();
     HttpResponse resp;
 
     std::string url = buildUrl(session_params);
@@ -192,9 +103,7 @@ HttpResponse HttpClient::executeQuery(const std::string & sql, const std::unorde
     curl_easy_setopt(handle_, CURLOPT_POSTFIELDSIZE, static_cast<long>(sql.size()));
     curl_easy_setopt(handle_, CURLOPT_WRITEFUNCTION, writeBodyCallback);
     curl_easy_setopt(handle_, CURLOPT_WRITEDATA, &resp.body);
-    curl_easy_setopt(handle_, CURLOPT_HEADERFUNCTION, writeHeaderCallback);
-    curl_easy_setopt(handle_, CURLOPT_HEADERDATA, &raw_headers_);
-    curl_easy_setopt(handle_, CURLOPT_TIMEOUT, db_.timeout_sec);
+    curl_easy_setopt(handle_, CURLOPT_TIMEOUT, fb_conn_.db->timeout_sec);
 
     curl_slist * auth_headers = buildAuthHeader();
     // Content-Type: text/plain so the server knows body is raw SQL
@@ -216,9 +125,10 @@ HttpResponse HttpClient::executeQuery(const std::string & sql, const std::unorde
 }
 
 HttpResponse HttpClient::executeInsert(
-    const std::string & sql, std::vector<uint8_t> arrow_ipc_bytes, const std::unordered_map<std::string, std::string> & session_params)
+    const std::string & sql,
+    const std::vector<uint8_t> & arrow_ipc_bytes,
+    const std::unordered_map<std::string, std::string> & session_params)
 {
-    resetResponseState();
     HttpResponse resp;
 
     std::string url = buildUrl(session_params);
@@ -227,9 +137,7 @@ HttpResponse HttpClient::executeInsert(
     curl_easy_setopt(handle_, CURLOPT_URL, url.c_str());
     curl_easy_setopt(handle_, CURLOPT_WRITEFUNCTION, writeBodyCallback);
     curl_easy_setopt(handle_, CURLOPT_WRITEDATA, &resp.body);
-    curl_easy_setopt(handle_, CURLOPT_HEADERFUNCTION, writeHeaderCallback);
-    curl_easy_setopt(handle_, CURLOPT_HEADERDATA, &raw_headers_);
-    curl_easy_setopt(handle_, CURLOPT_TIMEOUT, db_.timeout_sec);
+    curl_easy_setopt(handle_, CURLOPT_TIMEOUT, fb_conn_.db->timeout_sec);
 
     // Set auth header
     curl_slist * auth_headers = buildAuthHeader();

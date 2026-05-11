@@ -1,0 +1,142 @@
+"""Tiny in-process HTTP server that pretends to be a Firebolt query endpoint.
+
+Used by integration tests that need to exercise the driver against crafted
+response headers / status codes — scenarios a real Firebolt Core won't
+produce.  The server runs on a background thread bound to 127.0.0.1 inside
+the runner container; the driver inside the same container connects via
+http://127.0.0.1:<port>.
+
+Usage from a test:
+
+    def test_x(mock_server):
+        mock_server.queue(status=500, body=b"oops",
+                          headers=[("Firebolt-Update-Parameters", "database=evil")])
+        # ... drive ADBC ...
+        last = mock_server.last_request
+        assert "database=evil" not in last.path
+"""
+
+import dataclasses
+import http.server
+import socket
+import threading
+from collections import deque
+from typing import Iterable
+
+
+@dataclasses.dataclass
+class CapturedRequest:
+    method: str
+    path: str
+    headers: dict
+    body: bytes
+
+
+@dataclasses.dataclass
+class _QueuedResponse:
+    status: int
+    body: bytes
+    headers: list  # list of (name, value) tuples — duplicates allowed
+
+
+class MockFireboltServer:
+    """Thread-controlled HTTP server with a response queue.
+
+    Each `queue(...)` call enqueues one response that will be served on the
+    next incoming request.  When the queue is empty the server returns 200 OK
+    with empty body so the test can drive prologue / cleanup queries without
+    micromanaging every request.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queued: deque[_QueuedResponse] = deque()
+        self._captured: list[CapturedRequest] = []
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # silence default stderr logging
+                pass
+
+            def _read_body(self) -> bytes:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                return self.rfile.read(length) if length > 0 else b""
+
+            def _serve(self):
+                body = self._read_body()
+                with outer._lock:
+                    outer._captured.append(
+                        CapturedRequest(
+                            method=self.command,
+                            path=self.path,
+                            headers={k: v for k, v in self.headers.items()},
+                            body=body,
+                        )
+                    )
+                    response = (
+                        outer._queued.popleft() if outer._queued else _QueuedResponse(200, b"", [])
+                    )
+                self.send_response(response.status)
+                self.send_header("Content-Length", str(len(response.body)))
+                for name, value in response.headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                if response.body:
+                    self.wfile.write(response.body)
+
+            def do_GET(self):
+                self._serve()
+
+            def do_POST(self):
+                self._serve()
+
+            def do_PUT(self):
+                self._serve()
+
+        # Bind to port 0 to let the kernel pick a free port.
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.host, self.port = self._server.server_address
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2.0)
+
+    # ----- test-side controls -----------------------------------------------
+
+    def queue(self, *, status: int = 200, body: bytes = b"", headers: Iterable[tuple] = ()):
+        """Queue one response to be served on the next request."""
+        with self._lock:
+            self._queued.append(_QueuedResponse(status, body, list(headers)))
+
+    def reset(self):
+        """Drop all queued responses and captured requests."""
+        with self._lock:
+            self._queued.clear()
+            self._captured.clear()
+
+    @property
+    def captured(self) -> list[CapturedRequest]:
+        with self._lock:
+            return list(self._captured)
+
+    @property
+    def last_request(self) -> CapturedRequest | None:
+        with self._lock:
+            return self._captured[-1] if self._captured else None
+
+
+def find_free_port() -> int:
+    """Return a free TCP port on 127.0.0.1.  Useful for picking ports up-front."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]

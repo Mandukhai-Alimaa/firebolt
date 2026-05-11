@@ -241,6 +241,7 @@ add_library(firebolt_adbc SHARED
     src/FireboltAdbcDriver.cpp
     src/FireboltAdbcMetadata.cpp
     src/HttpClient.cpp
+    src/HttpHeaderParse.cpp
     src/ArrowIpcStream.cpp
     src/IngestSqlBuilder.cpp
 )
@@ -314,8 +315,10 @@ if (FIREBOLT_ADBC_BUILD_TESTS)
 
     add_executable(adbc_driver_tests
         tests/unit/adbc_driver_test.cpp
+        tests/unit/session_state_test.cpp
         src/ArrowIpcStream.cpp
         src/IngestSqlBuilder.cpp
+        src/HttpHeaderParse.cpp
     )
 
     target_include_directories(adbc_driver_tests PRIVATE
@@ -328,6 +331,7 @@ if (FIREBOLT_ADBC_BUILD_TESTS)
         firebolt_adbc
         ${_nanoarrow_target}
         ${_nanoarrow_ipc_target}
+        ${_curl_target}
         m
     )
 

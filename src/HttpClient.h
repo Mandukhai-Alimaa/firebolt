@@ -10,7 +10,7 @@
 namespace firebolt::adbc
 {
 
-struct FireboltDatabase;
+struct FireboltConnection;
 
 struct HttpResponse
 {
@@ -25,10 +25,53 @@ struct HttpResponse
     bool isSuccess() const { return curl_code == CURLE_OK && http_code >= 200 && http_code < 300; }
 };
 
+// Apply session-parameter mutations advertised in a response (Firebolt-Update-Parameters,
+// Firebolt-Remove-Parameters, Firebolt-Reset-Session) to the supplied session_params map
+// — but ONLY when the response succeeded.
+//
+// On non-2xx responses the server is by definition either not the legitimate Firebolt
+// endpoint (e.g. an injecting MITM, a generic-error proxy, a 502 from a sidecar) or
+// rejected the request, so its session-state hints are not trustworthy.  Applying
+// them unconditionally let a single 5xx response rebind `database=` for the rest of
+// the connection's life.
+//
+// Returns true when at least one mutation was applied.
+//
+// Defined inline so unit tests can call it without re-exporting symbols from the
+// hidden-visibility shared library.
+inline bool applySessionUpdatesIfSuccess(
+    std::unordered_map<std::string, std::string> & session_params, const HttpResponse & resp)
+{
+    if (!resp.isSuccess())
+        return false;
+    bool changed = false;
+    if (resp.reset_session)
+    {
+        if (!session_params.empty())
+            changed = true;
+        session_params.clear();
+    }
+    for (const auto & kv : resp.update_params)
+    {
+        auto it = session_params.find(kv.first);
+        if (it == session_params.end() || it->second != kv.second)
+            changed = true;
+        session_params[kv.first] = kv.second;
+    }
+    for (const auto & k : resp.remove_params)
+    {
+        if (session_params.erase(k) > 0)
+            changed = true;
+    }
+    return changed;
+}
+
 class HttpClient
 {
 public:
-    explicit HttpClient(const FireboltDatabase & db);
+    // Borrows the owning connection (lifetime guaranteed by its unique_ptr<HttpClient>);
+    // token, url, database, and timeout are read live on every request — no internal copies.
+    explicit HttpClient(const FireboltConnection & conn);
     ~HttpClient();
 
     HttpClient(const HttpClient &) = delete;
@@ -37,22 +80,23 @@ public:
     // SELECT / DDL
     HttpResponse executeQuery(const std::string & sql, const std::unordered_map<std::string, std::string> & session_params);
 
-    // INSERT with Arrow IPC payload
+    // INSERT with Arrow IPC payload.  The byte buffer is borrowed for the
+    // duration of the call — libcurl's curl_mime_data copies the bytes into
+    // its own storage, so no ownership transfer is needed.
     HttpResponse executeInsert(
-        const std::string & sql, std::vector<uint8_t> arrow_ipc_bytes, const std::unordered_map<std::string, std::string> & session_params);
+        const std::string & sql,
+        const std::vector<uint8_t> & arrow_ipc_bytes,
+        const std::unordered_map<std::string, std::string> & session_params);
 
 private:
     CURL * handle_ = nullptr;
-    const FireboltDatabase & db_;
-    std::string raw_headers_;
+    const FireboltConnection & fb_conn_;
 
     std::string buildUrl(const std::unordered_map<std::string, std::string> & session_params) const;
     curl_slist * buildAuthHeader() const;
     void parseResponseHeaders(HttpResponse & resp) const;
-    void resetResponseState();
 
     static size_t writeBodyCallback(char * ptr, size_t size, size_t nmemb, void * userdata);
-    static size_t writeHeaderCallback(char * ptr, size_t size, size_t nmemb, void * userdata);
 };
 
 } // namespace firebolt::adbc

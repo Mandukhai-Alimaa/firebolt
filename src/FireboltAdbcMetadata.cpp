@@ -1,6 +1,7 @@
 #include "FireboltAdbcMetadata.h"
 #include "ArrowIpcStream.h"
 #include "HttpClient.h"
+#include "IngestSqlBuilder.h"
 
 #include <nanoarrow/nanoarrow.hpp>
 #include <nanoarrow/nanoarrow_ipc.hpp>
@@ -100,6 +101,10 @@ static std::optional<int32_t> viewGetInt32(const ArrowArrayView * av, int64_t i)
 static std::string executeAndRead(FireboltConnection * conn, const std::string & sql, FlatResult & result)
 {
     auto resp = conn->http->executeQuery(sql, conn->session_params);
+    // Honour server-advertised session updates on success — keeps metadata-path
+    // session-state behaviour symmetric with the SQL-execution path so a server
+    // reset after a GetObjects call is not silently dropped.
+    applySessionUpdatesIfSuccess(conn->session_params, resp);
     if (!resp.isSuccess())
         return resp.error_message.empty() ? "HTTP error " + std::to_string(resp.http_code) : resp.error_message;
     if (resp.body.empty())
@@ -405,24 +410,8 @@ AdbcStatusCode ConnectionGetTableSchema(
     if (!table_name || !*table_name)
         return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "GetTableSchema: table_name is required");
 
-    // Build qualified name: ["schema".]"table"
-    std::string qualified;
-    if (db_schema && *db_schema)
-    {
-        qualified += '"';
-        qualified += db_schema;
-        qualified += "\".\"";
-        qualified += table_name;
-        qualified += '"';
-    }
-    else
-    {
-        qualified += '"';
-        qualified += table_name;
-        qualified += '"';
-    }
-
-    auto resp = conn->http->executeQuery("SELECT * FROM " + qualified + " LIMIT 0", conn->session_params);
+    auto resp = conn->http->executeQuery(buildTableSchemaSql(db_schema ? db_schema : "", table_name), conn->session_params);
+    applySessionUpdatesIfSuccess(conn->session_params, resp);
     if (!resp.isSuccess())
         return SetError(
             error,

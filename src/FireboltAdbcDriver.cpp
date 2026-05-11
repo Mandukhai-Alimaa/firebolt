@@ -5,6 +5,7 @@
 #include "FireboltAdbcStatement.h"
 #include "HttpClient.h"
 #include "IngestSqlBuilder.h"
+#include "ScopeGuard.h"
 #include "adbc.h"
 
 #include <nanoarrow/nanoarrow.hpp>
@@ -12,8 +13,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 
 #include <curl/curl.h>
@@ -56,14 +57,13 @@ static AdbcStatusCode HttpRespToStatus(const HttpResponse & resp, AdbcError * er
     return ADBC_STATUS_OK;
 }
 
+// Apply server-advertised session updates only when the response succeeded.
+// See applySessionUpdatesIfSuccess in HttpClient.h for the rationale — a 5xx
+// or 4xx response can be from a MITM or a generic-error proxy, so its
+// session-state hints are untrusted.
 static void ApplySessionUpdates(FireboltConnection * conn, const HttpResponse & resp)
 {
-    if (resp.reset_session)
-        conn->session_params.clear();
-    for (const auto & [k, v] : resp.update_params)
-        conn->session_params[k] = v;
-    for (const auto & k : resp.remove_params)
-        conn->session_params.erase(k);
+    applySessionUpdatesIfSuccess(conn->session_params, resp);
 }
 
 // ============================================================
@@ -242,8 +242,19 @@ static AdbcStatusCode ConnectionSetOption(AdbcConnection * conn, const char * ke
         fc->autocommit = want_autocommit;
         return ADBC_STATUS_OK;
     }
-    if (k == "adbc.firebolt.token" && fc->db)
-        fc->db->token = v;
+    if (k == "adbc.firebolt.token")
+    {
+        // Update the bearer token used in the Authorization header.  Stored
+        // per-connection (NOT on the shared FireboltDatabase) so two
+        // connections sharing the same AdbcDatabase keep independent
+        // identities.  HttpClient holds a const reference to this
+        // FireboltConnection and reads conn_.token live on each request, so
+        // no sync call is needed.  Never written into session_params: those
+        // are URL-encoded into the query string on every request and would
+        // leak the JWT into proxy and server access logs.
+        fc->token = v;
+        return ADBC_STATUS_OK;
+    }
 
     // Everything else stored as a session parameter appended to query URL
     fc->session_params[k] = v;
@@ -263,7 +274,20 @@ static AdbcStatusCode ConnectionInit(AdbcConnection * conn, AdbcDatabase * db, A
     try
     {
         fc->db = fdb;
-        fc->http = std::make_unique<HttpClient>(*fdb);
+        // Initialise the per-connection token from the database default,
+        // unless the caller already set a per-connection token via
+        // ConnectionSetOption("adbc.firebolt.token") between New and Init —
+        // ADBC permits options to be applied before Init, and silently
+        // dropping that token would fall back to the database identity.
+        // Subsequent ConnectionSetOption("adbc.firebolt.token") on this
+        // connection only mutates fc->token, never fdb->token.
+        if (fc->token.empty())
+            fc->token = fdb->token;
+        // HttpClient borrows a reference to this FireboltConnection and
+        // reads token / url / database / timeout live on every request.
+        // No need to seed or replay anything — the connection is the
+        // single source of truth.
+        fc->http = std::make_unique<HttpClient>(*fc);
         return ADBC_STATUS_OK;
     }
     catch (std::exception & ex)
@@ -400,7 +424,11 @@ static AdbcStatusCode StatementSetSqlQuery(AdbcStatement * stmt, const char * qu
         return SetError(error, ADBC_STATUS_INVALID_STATE, "Statement not initialized");
     if (!query)
         return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Query is null");
-    static_cast<FireboltStatement *>(stmt->private_data)->sql = query;
+    auto * fs = static_cast<FireboltStatement *>(stmt->private_data);
+    fs->sql = query;
+    // Bound ingest payload is tied to the previous SQL and must be dropped
+    // when the statement text changes.
+    fs->ingest.reset();
     return ADBC_STATUS_OK;
 }
 
@@ -563,6 +591,10 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
     if (rows_affected)
         *rows_affected = -1;
 
+    // Clear ingest state on every exit path so bound IPC payload is consumed
+    // exactly once (including failures/exceptions).
+    FIREBOLT_SCOPE_GUARD(if (fs->ingest.has_value()) fs->ingest.reset());
+
     try
     {
         // Lazy BEGIN: start a transaction on the first statement when autocommit is off.
@@ -579,6 +611,18 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
         // call to support statement reuse.  Each pre-SQL entry is sent as a
         // separate HTTP request — Firebolt rejects multiple statements in one body.
         const bool is_ingest = fs->ingest && !fs->ingest->target_table.empty();
+
+        // Atomicity gate: pre-SQL for Replace/Create/CreateAppend modes runs
+        // DDL (DROP / CREATE) before the multipart INSERT.  If no Arrow IPC
+        // payload was bound, the INSERT cannot land — Replace would have
+        // dropped the existing table and left it empty.  Reject the request
+        // BEFORE generating any pre-SQL so DDL never runs without DML.
+        if (is_ingest && fs->ingest->ipc_bytes.empty())
+            return SetError(
+                error,
+                ADBC_STATUS_INVALID_STATE,
+                "Ingest target set but no data bound; call Bind/BindStream before ExecuteQuery");
+
         std::vector<std::string> pre_sql;
         if (is_ingest)
         {
@@ -607,11 +651,7 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
         if (!resp.isSuccess())
             return HttpRespToStatus(resp, error);
 
-        // Clear ingest state on success so a reused statement (e.g. the dbapi
-        // cursor's underlying AdbcStatement) does not accidentally re-ingest
-        // the same payload on the next execute.
-        if (is_ingest)
-            fs->ingest.reset();
+        // Ingest state is cleared by FIREBOLT_SCOPE_GUARD at function exit.
 
         if (out)
         {

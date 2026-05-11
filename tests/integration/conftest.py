@@ -9,6 +9,7 @@ import pyarrow as pa
 import pytest
 
 from helpers import firebolt_core
+from helpers.mock_firebolt_server import MockFireboltServer
 
 
 ADBC_DRIVER_PATH = os.environ.get(
@@ -60,6 +61,32 @@ def run_query(conn):
 def table_name() -> str:
     """A unique table name for the duration of one test."""
     return f"adbc_test_{uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture
+def mock_server():
+    """An in-process HTTP server that lets a test inject crafted response
+    status codes and headers — used by security regression tests that need
+    to exercise scenarios a real Firebolt Core won't reproduce (e.g.
+    server-injected Firebolt-Update-Parameters on a 5xx response).
+
+    Function-scoped: each test gets a fresh queue and capture list.
+    """
+    server = MockFireboltServer()
+    server.start()
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def conn_to_mock(mock_server):
+    """An AdbcConnection pointed at the mock server instead of Firebolt Core."""
+    assert os.path.isfile(ADBC_DRIVER_PATH), f"ADBC driver not found at {ADBC_DRIVER_PATH}"
+    with adbc_driver_manager.AdbcDatabase(driver=ADBC_DRIVER_PATH, uri=mock_server.url) as db:
+        with adbc_driver_manager.AdbcConnection(db) as connection:
+            yield connection
 
 
 @pytest.fixture
