@@ -1,7 +1,7 @@
 # Minimal integration-test runner image for firebolt-adbc.
 #
 # Provides Python + pytest + adbc-driver-manager + docker CLI so that
-# adbc/tests/integration/runner.py can spin up a 1-node Firebolt Core
+# adbc/tests/integration/runner.py can spin up a 1-node Firebolt engine
 # via docker compose from inside the container.
 #
 # Built on demand by runner.py when firebolt-adbc-integration-test-runner:latest

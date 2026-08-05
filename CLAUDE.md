@@ -47,9 +47,9 @@ changelog
     ├── unit/
     │   └── adbc_driver_test.cpp           # Google Test unit tests (no server needed)
     └── integration/                       # pytest harness — runs inside a runner container
-        ├── runner.py                      # spins up runner image + 1-node Firebolt Core,
-        │                                  #   exec's pytest. Args: --core-image, --adbc-binary
-        ├── conftest.py                    # shared fixtures: started_core, server_url, conn,
+        ├── runner.py                      # spins up runner image + 1-node Firebolt engine,
+        │                                  #   exec's pytest. Args: --engine-image, --adbc-binary
+        ├── conftest.py                    # shared fixtures: started_engine, server_url, conn,
         │                                  #   run_query, table_name, temp_table
         ├── pytest.ini                     # python_files = test.py
         ├── docker/
@@ -57,7 +57,7 @@ changelog
         │   └── requirements.txt           # adbc-driver-manager, pyarrow, pytest, requests
         ├── helpers/
         │   ├── __init__.py
-        │   └── firebolt_core.py           # minimal docker-compose 1-node Firebolt Core fixture
+        │   └── firebolt_engine.py         # minimal docker-compose 1-node Firebolt engine fixture
         └── tests/                         # one directory per test area
             ├── adbc_sanity/test.py        # connectivity, literal selects, arithmetic, strings
             ├── advanced_queries/test.py   # joins, CTEs, CASE, HAVING, subqueries, window funcs
@@ -105,18 +105,27 @@ local development and CI invoke the same commands.
 # C++ unit tests (no server needed):
 ./scripts/test-unit.sh
 
-# Integration tests against a 1-node Firebolt Core (Docker required):
+# Integration tests against a 1-node Firebolt engine (Docker required):
 ./scripts/test-integration.sh                                    # all tests
 ./scripts/test-integration.sh -k test_connect                    # filter by name
 ./scripts/test-integration.sh tests/dml                          # one suite
-./scripts/test-integration.sh --core-image=...:latest -x         # override Core image
+./scripts/test-integration.sh --engine-image=...:latest -x       # override engine image
 ```
 
 `runner.py` builds `firebolt-adbc-integration-test-runner:latest` locally on
 first invocation (from `tests/integration/docker/Dockerfile`) — no registry
-needed for the runner. The Firebolt Core image (`--core-image`, default in
-`runner.py::DEFAULT_CORE_IMAGE`) is pulled if missing locally; on CI that pull
-needs ECR auth (see [.github/workflows/enable-merge-to-main.yaml](.github/workflows/enable-merge-to-main.yaml)).
+needed for the runner. The engine image (`--engine-image`, default in
+`runner.py::DEFAULT_ENGINE_IMAGE`) is pulled from the public GHCR repo on every
+run — it is a floating `:latest` tag, so a cached copy is only used as a
+fallback when the pull fails.
+
+The image ships the unified `firebolt` binary (server + client): its entrypoint
+execs `firebolt <args>` and its default command is
+`server --data-dir /var/lib/firebolt`. With no config file supplied the server
+starts from its built-in structured (YAML) defaults — one node, all interfaces,
+default ports — so the 1-node fixture writes no config at all. The legacy
+`--node N` + `/firebolt-core/config.json` startup contract is gone; a multi-node
+setup would bind-mount a `config.yaml` at `/var/lib/firebolt/config.yaml`.
 
 ## Key Design Decisions
 
@@ -138,12 +147,16 @@ needs ECR auth (see [.github/workflows/enable-merge-to-main.yaml](.github/workfl
 - **SQL injection safety** — `quoteIdentifier()` in `FireboltAdbcDriver.cpp` wraps table
   names and column names in double quotes (embedding `"` doubled) before they are
   interpolated into auto-generated INSERT SQL.
-- **Single source of truth for the Core image** — the registry string lives only in
-  `tests/integration/runner.py::DEFAULT_CORE_IMAGE`, flows through the
-  `FIREBOLT_CORE_IMAGE` env var into `helpers/firebolt_core.py::FireboltCore.__init__`,
-  and is inlined into the generated docker-compose yaml at run time.
+- **Single source of truth for the engine image** — the registry string lives only in
+  `tests/integration/runner.py::DEFAULT_ENGINE_IMAGE`, flows through the
+  `FIREBOLT_ENGINE_IMAGE` env var into
+  `helpers/firebolt_engine.py::FireboltInstance.__init__`, and is inlined into the
+  generated docker-compose yaml at run time.
+- **Readiness is `/ping` *and* `SELECT 1`** — `/ping` turns green before the engine can
+  serve queries ("Cluster not yet healthy"), so `FireboltInstance.start()` probes both
+  before handing the URL to tests.
 - **Generated test artifacts are gitignored** — every test run regenerates
-  `tests/integration/_test_runtime_root/` (compose yaml, config json, container logs);
+  `tests/integration/_test_runtime_root/` (compose yaml, container logs);
   the directory is in `.gitignore` so it is never committed.
 
 ## Dependencies

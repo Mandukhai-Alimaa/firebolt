@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run the pytest-based integration suite against a 1-node Firebolt Core.
+# Run the pytest-based integration suite against a 1-node Firebolt engine.
 #
 # Forwards extra args to runner.py, e.g.
-#   scripts/test-integration.sh --core-image=...:latest -k test_connect
+#   scripts/test-integration.sh --engine-image=...:latest -k test_connect
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"

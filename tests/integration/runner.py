@@ -2,15 +2,15 @@
 """Minimal integration test runner for firebolt-adbc.
 
 Runs pytest inside the firebolt-adbc-integration-test-runner image with libfirebolt_adbc.so
-bind-mounted in. The test itself spins up a 1-node Firebolt Core via docker compose
+bind-mounted in. The test itself spins up a 1-node Firebolt engine via docker compose
 from inside the runner container.
 
 Usage:
-    runner.py                                         # run all tests
-    runner.py -k test_connect                         # forwarded to pytest
-    runner.py --core-image=...:latest -k 'expr' -x    # mix of runner and pytest args
+    runner.py                                          # run all tests
+    runner.py -k test_connect                          # forwarded to pytest
+    runner.py --engine-image=...:latest -k 'expr' -x   # mix of runner and pytest args
 
-The known runner arguments are --core-image and --adbc-binary. Everything
+The known runner arguments are --engine-image and --adbc-binary. Everything
 else is forwarded to pytest as-is.
 """
 
@@ -26,7 +26,9 @@ import uuid
 
 
 RUNNER_IMAGE = "firebolt-adbc-integration-test-runner:latest"
-DEFAULT_CORE_IMAGE = "ghcr.io/firebolt-db/firebolt-core:4.32.0-pre.0.20260429090644.542714fe5ef7"
+# Firebolt engine image: the unified `firebolt` binary (server + client). Its entrypoint
+# execs `firebolt <args>` with a default command of `server --data-dir /var/lib/firebolt`.
+DEFAULT_ENGINE_IMAGE = "ghcr.io/firebolt-db/engine:latest"
 
 CUR_DIR = p.dirname(p.realpath(__file__))                        # adbc/tests/integration
 DOCKERFILE_DIR = p.join(CUR_DIR, "docker")                       # adbc/tests/integration/docker
@@ -75,30 +77,32 @@ def _ensure_runner_image(image: str):
 
 
 def _ensure_image(image: str):
-    """Skip the pull when `image` is already cached locally; otherwise pull.
+    """Pull `image`, falling back to a locally cached copy when the pull fails.
 
-    The Firebolt Core image lives in a private ECR repo that may not be reachable
-    without AWS credentials. The runner shares the host docker socket, so a copy
-    already pulled on the host is visible to docker compose inside the runner.
+    The default engine image is a floating tag (`:latest`), so a cached copy can be
+    arbitrarily stale — the pull is always attempted first. Offline or unauthenticated
+    runs still work as long as a local copy exists: the runner shares the host docker
+    socket, so an image pulled on the host is visible to docker compose inside it.
     """
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", image],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if inspect.returncode == 0:
-        logging.info("Core image %s present locally; skipping pull.", image)
-        return
-
     pull = subprocess.run(
         ["docker", "pull", image],
         stdout=sys.stdout, stderr=sys.stderr,
     )
     if pull.returncode == 0:
         return
+
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if inspect.returncode == 0:
+        logging.warning("docker pull %s failed; falling back to the local copy.", image)
+        return
+
     raise SystemExit(
         f"docker pull {image} failed and no local copy is available. "
-        "Authenticate to the registry (aws ecr get-login-password ... | docker login) "
-        "or pass --core-image=<reachable image>."
+        "Authenticate to the registry (docker login ghcr.io) "
+        "or pass --engine-image=<reachable image>."
     )
 
 
@@ -127,7 +131,7 @@ def _remove_bridge_network(network: str):
 
 
 def _launch_runner(
-    core_image: str, adbc_binary: str, pytest_args: list[str], project: str, network: str,
+    engine_image: str, adbc_binary: str, pytest_args: list[str], project: str, network: str,
 ) -> int:
     global _current_container, _current_network
     container = f"{project}_pytest"
@@ -159,7 +163,7 @@ def _launch_runner(
         f"--volume={adbc_so}:{adbc_so}",
         f"--workdir={workdir}",
         "-e", f"PACKDB_TESTS_ADBC_BINARY_PATH={adbc_so}",
-        "-e", f"FIREBOLT_CORE_IMAGE={core_image}",
+        "-e", f"FIREBOLT_ENGINE_IMAGE={engine_image}",
         "-e", f"COMPOSE_PROJECT_NAME={project}",
     ] + tty_flags + [
         RUNNER_IMAGE,
@@ -177,17 +181,17 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Minimal firebolt-adbc integration test runner. Builds "
-            f"{RUNNER_IMAGE} locally if missing, pulls the chosen firebolt-core image, "
+            f"{RUNNER_IMAGE} locally if missing, pulls the chosen engine image, "
             "creates a bridge network, and runs pytest inside the runner container.\n\n"
             "Unrecognised arguments are forwarded to pytest as-is, e.g.:\n"
             "  ./runner.py -k test_connect\n"
-            "  ./runner.py --core-image=...:latest -x tests/adbc_sanity"
+            "  ./runner.py --engine-image=...:latest -x tests/adbc_sanity"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--core-image", default=DEFAULT_CORE_IMAGE,
-        help=f"Firebolt Core Docker image (default: {DEFAULT_CORE_IMAGE})",
+        "--engine-image", default=DEFAULT_ENGINE_IMAGE,
+        help=f"Firebolt engine Docker image (default: {DEFAULT_ENGINE_IMAGE})",
     )
     parser.add_argument(
         "--adbc-binary", default=DEFAULT_ADBC_BINARY,
@@ -202,16 +206,18 @@ def main():
     network = f"{project}_default"
 
     print(f"Run ID: {run_id}")
-    print(f"Core image: {args.core_image}")
+    print(f"Engine image: {args.engine_image}")
     print(f"ADBC binary: {args.adbc_binary}")
     print(f"Pytest args: {pytest_args}")
 
     _ensure_runner_image(RUNNER_IMAGE)
-    _ensure_image(args.core_image)
+    _ensure_image(args.engine_image)
 
     _create_bridge_network(network, project)
     try:
-        retcode = _launch_runner(args.core_image, args.adbc_binary, pytest_args, project, network)
+        retcode = _launch_runner(
+            args.engine_image, args.adbc_binary, pytest_args, project, network
+        )
     finally:
         _remove_bridge_network(network)
 

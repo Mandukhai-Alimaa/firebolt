@@ -8,7 +8,7 @@ import adbc_driver_manager
 import pyarrow as pa
 import pytest
 
-from helpers import firebolt_core
+from helpers import firebolt_engine
 from helpers.mock_firebolt_server import MockFireboltServer
 
 
@@ -19,8 +19,8 @@ ADBC_DRIVER_PATH = os.environ.get(
 
 
 @pytest.fixture(scope="session")
-def started_core():
-    product = firebolt_core.FireboltCore(__file__)
+def started_engine():
+    product = firebolt_engine.FireboltInstance(__file__)
     product.add_engine(engine_name="engine1", num_nodes=1)
     product.start()
     try:
@@ -30,10 +30,10 @@ def started_core():
 
 
 @pytest.fixture(scope="session")
-def server_url(started_core):
+def server_url(started_engine):
     assert os.path.isfile(ADBC_DRIVER_PATH), f"ADBC driver not found at {ADBC_DRIVER_PATH}"
-    node = started_core.engines["engine1"].instances["node_1"]
-    return f"http://{node.pg_host}:{firebolt_core.FIREBOLT_CORE_QUERY_ENDPOINT}"
+    node = started_engine.engines["engine1"].instances["node_1"]
+    return f"http://{node.pg_host}:{firebolt_engine.QUERY_PORT}"
 
 
 @pytest.fixture
@@ -67,7 +67,7 @@ def table_name() -> str:
 def mock_server():
     """An in-process HTTP server that lets a test inject crafted response
     status codes and headers — used by security regression tests that need
-    to exercise scenarios a real Firebolt Core won't reproduce (e.g.
+    to exercise scenarios a real Firebolt engine won't reproduce (e.g.
     server-injected Firebolt-Update-Parameters on a 5xx response).
 
     Function-scoped: each test gets a fresh queue and capture list.
@@ -82,7 +82,7 @@ def mock_server():
 
 @pytest.fixture
 def conn_to_mock(mock_server):
-    """An AdbcConnection pointed at the mock server instead of Firebolt Core."""
+    """An AdbcConnection pointed at the mock server instead of a real engine."""
     assert os.path.isfile(ADBC_DRIVER_PATH), f"ADBC driver not found at {ADBC_DRIVER_PATH}"
     with adbc_driver_manager.AdbcDatabase(driver=ADBC_DRIVER_PATH, uri=mock_server.url) as db:
         with adbc_driver_manager.AdbcConnection(db) as connection:
