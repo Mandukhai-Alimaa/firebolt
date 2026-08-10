@@ -54,7 +54,7 @@ Set on `AdbcConnection`, before or after `AdbcConnectionInit`.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `adbc.connection.autocommit` | `true` | `false` starts explicit transactions: the driver issues `BEGIN` lazily before the first statement, and you then drive `AdbcConnectionCommit` / `AdbcConnectionRollback`. Setting it back to `true` while a transaction is open commits that transaction first. |
+| `adbc.connection.autocommit` | `true` | `false` starts explicit transactions: the driver issues `BEGIN` lazily before the first statement, and you then drive `AdbcConnectionCommit` / `AdbcConnectionRollback`. Setting it back to `true` while a transaction is open commits that transaction first. The value must be exactly `"true"` or `"false"`; anything else results in `ADBC_STATUS_INVALID_ARGUMENT` error. |
 | `adbc.firebolt.token` | inherited from the database | Per-connection bearer token. Two connections sharing one `AdbcDatabase` keep independent identities; setting it here never mutates the database default or the other connection. It is deliberately kept out of the session parameters below, because those are URL-encoded into every request line and would put the token in proxy and server access logs. May be set between `New` and `Init` — `Init` will not overwrite it. |
 | *any other key* | — | Stored as a **session parameter** and appended to the query URL of every subsequent request as `<key>=<value>` (URL-encoded). This is how you pass Firebolt query settings through. |
 

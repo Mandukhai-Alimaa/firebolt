@@ -139,8 +139,9 @@ can ingest, and what each becomes, is in
 
 ### Transactions
 
-Off by default. Pass `autocommit=False` and the driver issues `BEGIN` before your
-first statement:
+`dbapi.connect()` defaults to `autocommit=False` for PEP 249 compliance, so you
+are in a transaction whether or not you asked for one and the driver issues
+`BEGIN` before your first statement:
 
 ```python
 with dbapi.connect(driver=DRIVER, db_kwargs={"uri": URI}, autocommit=False) as conn:
@@ -148,6 +149,8 @@ with dbapi.connect(driver=DRIVER, db_kwargs={"uri": URI}, autocommit=False) as c
     cur.execute("INSERT INTO events VALUES (1, 'a')")
     conn.commit()   # or conn.rollback()
 ```
+
+Pass `autocommit=True` for each statement to stand on its own.
 
 ### Metadata
 
@@ -339,6 +342,8 @@ today's names to the canonical ones is in
 | `NOT_FOUND: Unknown Firebolt database option '…'` | A misspelled `adbc.firebolt.*` key. Compare against [OPTIONS.md](OPTIONS.md). |
 | `NOT_IMPLEMENTED: Temporary ingest tables are not supported` | `adbc_ingest(..., temporary=True)`. Firebolt has no session-temporary tables. |
 | `NOT_IMPLEMENTED: ingest column type cannot be mapped …` | The Arrow schema has a type with no Firebolt equivalent. Cast it before ingesting. |
+| `current transaction is aborted, commands will be ignored …` | A statement failed inside an open transaction. Call `conn.rollback()`. `dbapi.connect()` disables autocommit by default, so you may be in a transaction you did not open. |
+| `INVALID_ARGUMENT: Option 'adbc.connection.autocommit' must be exactly …` | Use the string `"true"` or `"false"`; `"0"` and `"FALSE"` are refused rather than guessed at. |
 | `dlopen() failed: … cannot open shared object file` | The driver path is wrong, or the manifest name does not match the `driver=` value. |
 | `cursor.rowcount` is `-1` | Expected; see [Feature & Type Support](#feature--type-support). Use `SELECT count(*)` if you need a count. |
 

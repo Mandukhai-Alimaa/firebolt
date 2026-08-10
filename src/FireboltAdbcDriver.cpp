@@ -337,7 +337,20 @@ static AdbcStatusCode ConnectionSetOption(AdbcConnection * conn, const char * ke
 
     if (k == ADBC_CONNECTION_OPTION_AUTOCOMMIT)
     {
-        bool want_autocommit = (v != ADBC_OPTION_VALUE_DISABLED);
+        // ADBC canonicalises exactly two values for a boolean option.  Treating
+        // "anything that is not false" as true made "0", "FALSE" and any typo
+        // silently mean autocommit ON — and this is the one option where
+        // misreading the value changes durability rather than just behaviour:
+        // the caller believes they are inside a transaction while every
+        // statement is being committed as it executes.  Refuse instead.
+        if (v != ADBC_OPTION_VALUE_ENABLED && v != ADBC_OPTION_VALUE_DISABLED)
+            return SetError(
+                error,
+                ADBC_STATUS_INVALID_ARGUMENT,
+                "Option '" + k + "' must be exactly \"" + ADBC_OPTION_VALUE_ENABLED + "\" or \"" + ADBC_OPTION_VALUE_DISABLED + "\"; got '"
+                    + v + "'");
+
+        const bool want_autocommit = (v == ADBC_OPTION_VALUE_ENABLED);
         if (want_autocommit && !fc->autocommit && fc->in_transaction && fc->http)
         {
             // Switching back to autocommit while inside a transaction: commit it.

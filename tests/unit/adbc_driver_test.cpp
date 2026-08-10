@@ -1359,6 +1359,118 @@ TEST(StatementExecuteTest, BindWithoutIngestTargetRejected)
     driver.DatabaseRelease(&db, nullptr);
 }
 
+// ADBC canonicalises exactly two values for a boolean option: "true" and
+// "false" (ADBC_OPTION_VALUE_ENABLED / _DISABLED).  The autocommit branch used
+// to read `v != "false"`, so every other spelling — "0", "FALSE", a typo, the
+// empty string — silently meant autocommit ON.  That is the one option where
+// misreading the value changes durability: a caller who believes they opened a
+// transaction gets each statement committed as it executes, and their
+// subsequent commit()/rollback() fails with INVALID_STATE against data that is
+// already permanent.  Anything non-canonical has to be refused.
+namespace
+{
+
+// Set the autocommit option on a fresh connection and return its status.
+AdbcStatusCode SetAutocommit(AdbcDriver & driver, AdbcDatabase & db, const char * value, AdbcError * error)
+{
+    AdbcConnection conn{};
+    EXPECT_EQ(driver.ConnectionNew(&conn, error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.ConnectionInit(&conn, &db, error), ADBC_STATUS_OK);
+    AdbcStatusCode code = driver.ConnectionSetOption(&conn, ADBC_CONNECTION_OPTION_AUTOCOMMIT, value, error);
+    driver.ConnectionRelease(&conn, nullptr);
+    return code;
+}
+
+} // namespace
+
+TEST(AutocommitTest, CanonicalValuesAccepted)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    SetupDatabase(driver, db);
+    AdbcError error = ADBC_ERROR_INIT;
+
+    EXPECT_EQ(SetAutocommit(driver, db, ADBC_OPTION_VALUE_ENABLED, &error), ADBC_STATUS_OK);
+    EXPECT_EQ(SetAutocommit(driver, db, ADBC_OPTION_VALUE_DISABLED, &error), ADBC_STATUS_OK);
+
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(AutocommitTest, NonCanonicalValuesRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    SetupDatabase(driver, db);
+
+    // "0" and "FALSE" are the dangerous ones: a caller means autocommit off and
+    // silently gets it on.  The rest guard against the same class of typo.
+    for (const char * value : {"0", "1", "FALSE", "True", "flase", "", "yes", "off"})
+    {
+        AdbcError error = ADBC_ERROR_INIT;
+        EXPECT_EQ(SetAutocommit(driver, db, value, &error), ADBC_STATUS_INVALID_ARGUMENT)
+            << "value=" << value << " must not be silently reinterpreted";
+        if (error.message)
+            EXPECT_NE(std::string(error.message).find("autocommit"), std::string::npos)
+                << "error should name the option, got: " << error.message;
+        if (error.release)
+            error.release(&error);
+    }
+
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+TEST(AutocommitTest, RejectedValueLeavesModeUnchanged)
+{
+    // A refused value must not half-apply: the connection has to keep whatever
+    // mode it had, so the caller's next statement behaves predictably.
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcConnection conn{};
+    SetupConnection(driver, db, conn);
+    AdbcError error = ADBC_ERROR_INIT;
+
+    auto * fc = static_cast<firebolt::adbc::FireboltConnection *>(conn.private_data);
+    ASSERT_NE(fc, nullptr);
+    ASSERT_TRUE(fc->autocommit) << "autocommit is the ADBC default";
+
+    // Turn it off legitimately, then try to turn it back on with a bad spelling.
+    ASSERT_EQ(driver.ConnectionSetOption(&conn, ADBC_CONNECTION_OPTION_AUTOCOMMIT, ADBC_OPTION_VALUE_DISABLED, &error), ADBC_STATUS_OK);
+    ASSERT_FALSE(fc->autocommit);
+
+    EXPECT_EQ(driver.ConnectionSetOption(&conn, ADBC_CONNECTION_OPTION_AUTOCOMMIT, "1", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_FALSE(fc->autocommit) << "a rejected value must not change the mode";
+
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+// The autocommit key must not fall through to the session-parameter catch-all
+// either: a rejected value that still landed in session_params would be
+// URL-encoded onto every request.
+TEST(AutocommitTest, RejectedValueNotStoredAsSessionParam)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcConnection conn{};
+    SetupConnection(driver, db, conn);
+    AdbcError error = ADBC_ERROR_INIT;
+
+    EXPECT_EQ(driver.ConnectionSetOption(&conn, ADBC_CONNECTION_OPTION_AUTOCOMMIT, "0", &error), ADBC_STATUS_INVALID_ARGUMENT);
+
+    auto * fc = static_cast<firebolt::adbc::FireboltConnection *>(conn.private_data);
+    ASSERT_NE(fc, nullptr);
+    EXPECT_EQ(fc->session_params.count(ADBC_CONNECTION_OPTION_AUTOCOMMIT), 0u);
+
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
 TEST(AutocommitTest, CommitRollbackInAutocommitFails)
 {
     // Commit and rollback in autocommit mode (the default) must fail with
