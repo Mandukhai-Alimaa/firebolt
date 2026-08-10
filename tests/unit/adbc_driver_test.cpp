@@ -9,6 +9,8 @@
 #include <nanoarrow/nanoarrow.hpp>
 #include <nanoarrow/nanoarrow_ipc.hpp>
 
+#include <curl/curl.h>
+
 #include <cstring>
 #include <string>
 #include <vector>
@@ -16,6 +18,16 @@
 // Entry points defined in FireboltAdbcDriver.cpp
 extern "C" AdbcStatusCode AdbcDriverInit(int version, void * raw_driver, AdbcError * error);
 extern "C" AdbcStatusCode FireboltAdbcDriverInit(int version, void * raw_driver, AdbcError * error);
+
+// Whether the libcurl this driver is linked against can speak TLS.  The
+// shipped build sets -DWITH_SSL=OFF, so it cannot; the https:// rejection
+// below is conditioned on this rather than on a build-time define, so the
+// same test is correct for either configuration.
+static bool CurlHasTls()
+{
+    const curl_version_info_data * v = curl_version_info(CURLVERSION_NOW);
+    return v != nullptr && (v->features & CURL_VERSION_SSL) != 0;
+}
 
 // ============================================================
 // Helper: call AdbcDriverInit and return a populated driver
@@ -31,6 +43,36 @@ static AdbcDriver InitDriver()
         error.release(&error);
     return driver;
 }
+
+// ============================================================
+// Helper: build Arrow schemas for the type-mapping tests
+// ============================================================
+
+namespace
+{
+
+// Build an initialised top-level (struct) schema with `n_columns` unset columns,
+// ready for the caller to type and name each one.
+nanoarrow::UniqueSchema MakeTopLevelSchema(int64_t n_columns)
+{
+    nanoarrow::UniqueSchema schema;
+    ArrowSchemaInit(schema.get());
+    EXPECT_EQ(ArrowSchemaSetTypeStruct(schema.get(), n_columns), 0);
+    return schema;
+}
+
+// Build a top-level struct schema with one column for the given type and name.
+nanoarrow::UniqueSchema MakeStructSchemaWithColumn(ArrowType column_type, const std::string & column_name, bool nullable = true)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    EXPECT_EQ(ArrowSchemaSetType(schema->children[0], column_type), 0);
+    EXPECT_EQ(ArrowSchemaSetName(schema->children[0], column_name.c_str()), 0);
+    if (!nullable)
+        schema->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
+    return schema;
+}
+
+} // namespace
 
 // ============================================================
 // Tests: driver init
@@ -100,6 +142,226 @@ TEST(DatabaseTest, InitWithoutUrlFails)
     EXPECT_NE(error.message, nullptr);
 
     driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+// ============================================================
+// Tests: database option validation — an unusable option must
+// not be accepted silently.  Every case below used to return
+// ADBC_STATUS_OK (or throw across the C ABI), so a typo or a
+// malformed value produced a connection that quietly did the
+// wrong thing.
+//
+// A rejected option is reported by DatabaseInit, not by
+// DatabaseSetOption, and deliberately so: see RejectOption in
+// FireboltAdbcDriver.cpp — the driver manager replays pre-Init
+// options from inside AdbcDatabaseInit and its failure path
+// there overflows a heap buffer by one byte.
+// ============================================================
+
+namespace
+{
+
+// DatabaseNew + one SetOption + Init.  Returns the Init status, which is where a
+// bad option surfaces; `error` is left populated for the caller.
+AdbcStatusCode InitWithOption(AdbcDriver & driver, const char * key, const char * value, AdbcError * error)
+{
+    AdbcDatabase db{};
+    EXPECT_EQ(driver.DatabaseNew(&db, error), ADBC_STATUS_OK);
+    // A valid uri, so that Init fails on the option under test and nothing else.
+    EXPECT_EQ(driver.DatabaseSetOption(&db, "uri", "http://localhost:3473", error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.DatabaseSetOption(&db, key, value, error), ADBC_STATUS_OK)
+        << "a pre-Init option must not be refused on the spot; Init reports it";
+    AdbcStatusCode code = driver.DatabaseInit(&db, error);
+    driver.DatabaseRelease(&db, nullptr);
+    return code;
+}
+
+} // namespace
+
+TEST(DatabaseOptionTest, UnknownFireboltOptionRejected)
+{
+    // A typo in a driver-namespaced key is a configuration bug, not something
+    // to swallow: `adbc.firebolt.databse` would otherwise leave the connection
+    // pointed at the server's default database with no diagnostic anywhere.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.databse", "mydb", &error), ADBC_STATUS_NOT_FOUND);
+    ASSERT_NE(error.message, nullptr);
+    EXPECT_NE(std::string(error.message).find("adbc.firebolt.databse"), std::string::npos)
+        << "the error should name the offending key, got: " << error.message;
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, UnknownFireboltOptionRejectedImmediatelyAfterInit)
+{
+    // Past Init there is no option replay, so there is no reason to defer.
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://localhost:3473", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.DatabaseSetOption(&db, "adbc.firebolt.nonsense", "x", &error), ADBC_STATUS_NOT_FOUND);
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, NonNamespacedOptionStillAccepted)
+{
+    // Keys outside the adbc.firebolt.* namespace are set by the driver manager
+    // itself and by callers passing future connection parameters; they must
+    // keep being accepted so that rejecting typos does not break them.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "username", "svc", &error), ADBC_STATUS_OK);
+    EXPECT_EQ(InitWithOption(driver, "adbc.connection.catalog", "warehouse", &error), ADBC_STATUS_OK);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, NonNumericTimeoutRejected)
+{
+    // std::stol throws std::invalid_argument on this input.  The throw escaped
+    // through the C ABI boundary into a driver manager with no handler, which
+    // aborts the host process.  It has to become a status code.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "soon", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(error.message, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, TimeoutWithTrailingGarbageRejected)
+{
+    // std::stol would happily parse "30s" as 30 and drop the suffix.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "30s", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, OutOfRangeTimeoutRejected)
+{
+    // std::out_of_range, same C ABI problem as above.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "99999999999999999999999", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, NegativeTimeoutRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "-5", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, ValidTimeoutAccepted)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "30", &error), ADBC_STATUS_OK);
+    EXPECT_EQ(InitWithOption(driver, "adbc.firebolt.timeout_sec", "0", &error), ADBC_STATUS_OK);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseOptionTest, FirstRejectedOptionIsTheOneReported)
+{
+    // Several bad options: the first is kept so the message is deterministic.
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://localhost:3473", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "adbc.firebolt.first_typo", "a", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "adbc.firebolt.second_typo", "b", &error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_NOT_FOUND);
+    ASSERT_NE(error.message, nullptr);
+    EXPECT_NE(std::string(error.message).find("first_typo"), std::string::npos) << "got: " << error.message;
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+// ============================================================
+// Tests: DatabaseInit — uri validation.  Without these, a bad
+// scheme surfaces as a bare libcurl string ("Unsupported
+// protocol", "URL using bad/illegal format") at first query,
+// far from the option that caused it.
+// ============================================================
+
+namespace
+{
+
+AdbcStatusCode InitWithUri(AdbcDriver & driver, const char * uri, AdbcError * error)
+{
+    AdbcDatabase db{};
+    EXPECT_EQ(driver.DatabaseNew(&db, error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.DatabaseSetOption(&db, "uri", uri, error), ADBC_STATUS_OK);
+    AdbcStatusCode code = driver.DatabaseInit(&db, error);
+    driver.DatabaseRelease(&db, nullptr);
+    return code;
+}
+
+} // namespace
+
+TEST(DatabaseInitTest, UriWithoutSchemeRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithUri(driver, "localhost:3473", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(error.message, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseInitTest, UnsupportedSchemeRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithUri(driver, "firebolt://localhost:3473/db", &error), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseInitTest, PlainHttpUriAccepted)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    EXPECT_EQ(InitWithUri(driver, "http://localhost:3473", &error), ADBC_STATUS_OK);
+    if (error.release)
+        error.release(&error);
+}
+
+TEST(DatabaseInitTest, HttpsUriRejectedWhenCurlHasNoTls)
+{
+    // The shipped build links curl without TLS, so https:// can never work.
+    // Say so at Init, naming the limitation, instead of letting the first
+    // query fail with CURLE_UNSUPPORTED_PROTOCOL.
+    AdbcDriver driver = InitDriver();
+    AdbcError error = ADBC_ERROR_INIT;
+    AdbcStatusCode code = InitWithUri(driver, "https://api.example.com", &error);
+    if (CurlHasTls())
+    {
+        EXPECT_EQ(code, ADBC_STATUS_OK) << "this build has TLS; https:// must be accepted";
+    }
+    else
+    {
+        EXPECT_EQ(code, ADBC_STATUS_INVALID_ARGUMENT);
+        ASSERT_NE(error.message, nullptr);
+        EXPECT_NE(std::string(error.message).find("TLS"), std::string::npos)
+            << "error should name the missing capability, got: " << error.message;
+    }
     if (error.release)
         error.release(&error);
 }
@@ -360,9 +622,7 @@ TEST(ArrowIpcStreamTest, EmptyBodyProducesEmptyStream)
 TEST(ArrowIpcStreamTest, RoundTripIpcBytes)
 {
     // Build a simple int32 record batch using nanoarrow
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT32), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "x"), 0);
 
@@ -509,27 +769,6 @@ TEST(GetTableSchemaSqlTest, RejectsSqlInjectionAttempt)
 // Tests: IngestSqlBuilder — Arrow → Firebolt SQL type mapping
 // ============================================================
 
-namespace
-{
-
-// Build a top-level struct schema with one column for the given type and name.
-// `setup` runs after ArrowSchemaInit + ArrowSchemaSetType[FromType] so callers
-// can adjust nullability or set parameters that need a typed schema.
-nanoarrow::UniqueSchema MakeStructSchemaWithColumn(
-    ArrowType column_type, const std::string & column_name, bool nullable = true)
-{
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    EXPECT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
-    EXPECT_EQ(ArrowSchemaSetType(schema->children[0], column_type), 0);
-    EXPECT_EQ(ArrowSchemaSetName(schema->children[0], column_name.c_str()), 0);
-    if (!nullable)
-        schema->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
-    return schema;
-}
-
-} // namespace
-
 TEST(ArrowToFireboltTypeTest, BoolMapsToBoolean)
 {
     auto schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_BOOL, "x");
@@ -580,9 +819,7 @@ TEST(ArrowToFireboltTypeTest, Date32MapsToDate)
 
 TEST(ArrowToFireboltTypeTest, TimestampNoTimezoneMapsToTimestampNtz)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP, NANOARROW_TIME_UNIT_MICRO, nullptr), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "x"), 0);
     EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]), "TIMESTAMPNTZ");
@@ -590,9 +827,7 @@ TEST(ArrowToFireboltTypeTest, TimestampNoTimezoneMapsToTimestampNtz)
 
 TEST(ArrowToFireboltTypeTest, TimestampWithTimezoneMapsToTimestampTz)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP, NANOARROW_TIME_UNIT_MICRO, "UTC"), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "x"), 0);
     EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]), "TIMESTAMPTZ");
@@ -600,9 +835,7 @@ TEST(ArrowToFireboltTypeTest, TimestampWithTimezoneMapsToTimestampTz)
 
 TEST(ArrowToFireboltTypeTest, Decimal128PreservesPrecisionAndScale)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetTypeDecimal(schema->children[0], NANOARROW_TYPE_DECIMAL128, 18, 4), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "x"), 0);
     EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]), "DECIMAL(18, 4)");
@@ -610,9 +843,7 @@ TEST(ArrowToFireboltTypeTest, Decimal128PreservesPrecisionAndScale)
 
 TEST(ArrowToFireboltTypeTest, ListOfIntMapsToArrayInt)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_LIST), 0);
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0]->children[0], NANOARROW_TYPE_INT32), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "vals"), 0);
@@ -621,10 +852,12 @@ TEST(ArrowToFireboltTypeTest, ListOfIntMapsToArrayInt)
 
 TEST(ArrowToFireboltTypeTest, StructMapsToFireboltStruct)
 {
-    // STRUCT<id:int32 not null, name:string>
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    // STRUCT<id:int32 not null, name:string>.  `id` is non-nullable on purpose:
+    // Firebolt rejects a non-nullable STRUCT field ("STRUCT fields have to be
+    // nullable"), so the field nullability has to be dropped here — otherwise
+    // create-mode ingest emits DDL the server refuses.  Column-level nullability
+    // is rendered by buildCreateTableColumns instead.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetTypeStruct(schema->children[0], 2), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "person"), 0);
 
@@ -635,9 +868,135 @@ TEST(ArrowToFireboltTypeTest, StructMapsToFireboltStruct)
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0]->children[1], NANOARROW_TYPE_STRING), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0]->children[1], "name"), 0);
 
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]), "STRUCT(\"id\" INT, \"name\" TEXT)");
+}
+
+TEST(ArrowToFireboltTypeTest, NestedStructMapsToNestedFireboltStruct)
+{
+    // STRUCT<x:int32, child:STRUCT<y:int64, z:string>>
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer, 2), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "s"), 0);
+
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0], "x"), 0);
+
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer->children[1], 2), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[1], "child"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1]->children[0], NANOARROW_TYPE_INT64), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[1]->children[0], "y"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1]->children[1], NANOARROW_TYPE_STRING), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[1]->children[1], "z"), 0);
+
     EXPECT_EQ(
-        firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]),
-        "STRUCT(\"id\" INT NOT NULL, \"name\" TEXT)");
+        firebolt::adbc::arrowTypeToFireboltSqlType(outer),
+        "STRUCT(\"x\" INT, \"child\" STRUCT(\"y\" BIGINT, \"z\" TEXT))");
+}
+
+TEST(ArrowToFireboltTypeTest, ListOfStructMapsToArrayOfStruct)
+{
+    // LIST<STRUCT<k:int32, v:string>>
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * list = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetType(list, NANOARROW_TYPE_LIST), 0);
+    ASSERT_EQ(ArrowSchemaSetName(list, "items"), 0);
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(list->children[0], 2), 0);
+    ASSERT_EQ(ArrowSchemaSetType(list->children[0]->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(list->children[0]->children[0], "k"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(list->children[0]->children[1], NANOARROW_TYPE_STRING), 0);
+    ASSERT_EQ(ArrowSchemaSetName(list->children[0]->children[1], "v"), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(list), "ARRAY(STRUCT(\"k\" INT, \"v\" TEXT))");
+}
+
+TEST(ArrowToFireboltTypeTest, StructContainingListMapsToStructWithArray)
+{
+    // STRUCT<xs:LIST<int32>>
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer, 1), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "s"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_LIST), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0], "xs"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0]->children[0], NANOARROW_TYPE_INT32), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "STRUCT(\"xs\" ARRAY(INT))");
+}
+
+TEST(ArrowToFireboltTypeTest, NestedListOfStructMapsToNestedArrayOfStruct)
+{
+    // LIST<LIST<STRUCT<m:int32>>> — every list level has to be descended.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetType(outer, NANOARROW_TYPE_LIST), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "aas"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_LARGE_LIST), 0);
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer->children[0]->children[0], 1), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0]->children[0]->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0]->children[0]->children[0], "m"), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "ARRAY(ARRAY(STRUCT(\"m\" INT)))");
+}
+
+TEST(ArrowToFireboltTypeTest, StructFieldNamesAreQuotedAndEscaped)
+{
+    // A reserved keyword and an embedded double quote both have to survive
+    // quoting, or the generated DDL is either rejected or injectable.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer, 2), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "s"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0], "order"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1], NANOARROW_TYPE_STRING), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[1], "a\"b"), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "STRUCT(\"order\" INT, \"a\"\"b\" TEXT)");
+}
+
+TEST(ArrowToFireboltTypeTest, EmptyStructReturnsEmpty)
+{
+    // Firebolt has no zero-field STRUCT; rendering "STRUCT()" would produce a
+    // syntax error at the server. The mapping must fail up front instead, so
+    // buildIngestSql reports ADBC_STATUS_NOT_IMPLEMENTED.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema->children[0], 0), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "s"), 0);
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(schema->children[0]), "");
+}
+
+TEST(ArrowToFireboltTypeTest, StructWithUnsupportedFieldReturnsEmpty)
+{
+    // A field type with no Firebolt equivalent (here MAP, which read_arrow() also
+    // rejects) has to fail the whole struct rather than be skipped.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer, 2), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "s"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0], "ok"), 0);
+    // MAP allocates an "entries" struct child; its key/value still need types.
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1], NANOARROW_TYPE_MAP), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1]->children[0]->children[0], NANOARROW_TYPE_STRING), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[1]->children[0]->children[1], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[1], "bad"), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "");
+}
+
+TEST(ArrowToFireboltTypeTest, UnnamedStructFieldReturnsEmpty)
+{
+    // A nameless field would render as the empty identifier `""`; reject it the
+    // same way buildCreateTableColumns rejects a nameless column.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * outer = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(outer, 1), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer, "s"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(outer->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(outer->children[0], nullptr), 0);
+
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "");
 }
 
 TEST(ArrowToFireboltTypeTest, UnsupportedTypeReturnsEmpty)
@@ -652,9 +1011,7 @@ TEST(ArrowToFireboltTypeTest, UnsupportedTypeReturnsEmpty)
 
 TEST(BuildCreateTableColumnsTest, MultipleColumns)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 3), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(3);
 
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT32), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "id"), 0);
@@ -671,19 +1028,31 @@ TEST(BuildCreateTableColumnsTest, MultipleColumns)
         "\"id\" INT NOT NULL, \"label\" TEXT, \"value\" DOUBLE PRECISION");
 }
 
+TEST(BuildCreateTableColumnsTest, NotNullStructColumnKeepsColumnLevelNotNull)
+{
+    // NOT NULL is legal on the column but not on the struct's fields; the two
+    // levels must not be conflated.
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ArrowSchema * col = schema->children[0];
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(col, 1), 0);
+    ASSERT_EQ(ArrowSchemaSetName(col, "s"), 0);
+    col->flags &= ~ARROW_FLAG_NULLABLE; // column: NOT NULL
+    ASSERT_EQ(ArrowSchemaSetType(col->children[0], NANOARROW_TYPE_INT32), 0);
+    ASSERT_EQ(ArrowSchemaSetName(col->children[0], "a"), 0);
+    col->children[0]->flags &= ~ARROW_FLAG_NULLABLE; // field: must be dropped
+
+    EXPECT_EQ(firebolt::adbc::buildCreateTableColumns(schema.get()), "\"s\" STRUCT(\"a\" INT) NOT NULL");
+}
+
 TEST(BuildCreateTableColumnsTest, EmptySchemaReturnsEmpty)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 0), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(0);
     EXPECT_EQ(firebolt::adbc::buildCreateTableColumns(schema.get()), "");
 }
 
 TEST(BuildCreateTableColumnsTest, UnsupportedColumnTypeReturnsEmpty)
 {
-    nanoarrow::UniqueSchema schema;
-    ArrowSchemaInit(schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 1), 0);
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
     ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INTERVAL_DAY_TIME), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "x"), 0);
     EXPECT_EQ(firebolt::adbc::buildCreateTableColumns(schema.get()), "");
@@ -937,6 +1306,51 @@ TEST(StatementReuseTest, IngestStateClearedOnFailedExecute)
 
     EXPECT_FALSE(fs->ingest.has_value())
         << "ingest state survived a failed ExecuteQuery; bound bytes would attach to next query";
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// Firebolt's HTTP interface has no parameter binding, and this driver's
+// Bind/BindStream exist only to carry a bulk-ingest payload.  When a caller
+// binds data with no ingest target — exactly what
+// `cursor.execute(sql, params)` does in the dbapi layer — ExecuteQuery used
+// to take the multipart-insert branch anyway (it keys on `ipc_bytes` alone),
+// POSTing the user's SELECT plus a data.arrow part.  The server then fails
+// with an opaque error about the upload.  Refuse it up front instead.
+TEST(StatementExecuteTest, BindWithoutIngestTargetRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    // Unreachable port: if the request is attempted, the status is IO, not
+    // NOT_IMPLEMENTED, so this also proves nothing left the box.
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT ?", &error), ADBC_STATUS_OK);
+
+    // Simulate a parameter bind: payload present, no ingest target configured.
+    auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
+    ASSERT_NE(fs, nullptr);
+    fs->initAndGetIngestState().ipc_bytes = {0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_TRUE(fs->ingest->target_table.empty());
+
+    AdbcStatusCode rc = driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error);
+    EXPECT_EQ(rc, ADBC_STATUS_NOT_IMPLEMENTED) << "bound data with no ingest target must be refused, not sent as a multipart insert";
+    if (error.message)
+        EXPECT_NE(std::string(error.message).find("parameter"), std::string::npos)
+            << "error should point at parameter binding, got: " << error.message;
 
     if (error.release)
         error.release(&error);

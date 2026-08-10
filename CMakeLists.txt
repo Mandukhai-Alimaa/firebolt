@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(firebolt_adbc VERSION 1.1.0 LANGUAGES C CXX)
+# The driver's own version — distinct from the ADBC specification version it
+# implements (1.1.0, reported separately as ADBC_INFO_DRIVER_ADBC_VERSION).
+# This is the single source of truth: it feeds the shared library soname and
+# the ADBC_INFO_DRIVER_VERSION string via src/Version.h.in.  Bump it in the
+# same commit as the release tag.
+project(firebolt_adbc VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -237,6 +242,12 @@ if (FIREBOLT_ADBC_STRIP_DEP_DEBUG)
     endif ()
 endif ()
 
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/Version.h"
+    @ONLY
+)
+
 add_library(firebolt_adbc SHARED
     src/FireboltAdbcDriver.cpp
     src/FireboltAdbcMetadata.cpp
@@ -249,13 +260,14 @@ add_library(firebolt_adbc SHARED
 set_target_properties(firebolt_adbc PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
-    VERSION 1.1.0
-    SOVERSION 1
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
 target_include_directories(firebolt_adbc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 target_link_libraries(firebolt_adbc PRIVATE

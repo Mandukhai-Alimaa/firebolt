@@ -20,29 +20,8 @@ from adbc_driver_manager import dbapi
 
 
 # --------------------------------------------------------------------------- #
-# Fixtures                                                                    #
+# Helpers  (the `cursor` / `dbapi_conn` fixtures live in conftest.py)          #
 # --------------------------------------------------------------------------- #
-
-@pytest.fixture
-def dbapi_conn(server_url):
-    """A DBAPI-style Connection that opens its own AdbcDatabase + AdbcConnection.
-
-    autocommit=True so each adbc_ingest() commits immediately and the data
-    becomes visible to the read fixtures (which use a separate AdbcConnection).
-    """
-    from conftest import ADBC_DRIVER_PATH
-    with dbapi.connect(
-        driver=ADBC_DRIVER_PATH, db_kwargs={"uri": server_url}, autocommit=True
-    ) as c:
-        yield c
-
-
-@pytest.fixture
-def cursor(dbapi_conn):
-    """A DBAPI Cursor for adbc_ingest()-level tests."""
-    with dbapi_conn.cursor() as cur:
-        yield cur
-
 
 def _row_count(run_query, table_name):
     return run_query(f"SELECT COUNT(*) AS n FROM {table_name}")["n"][0].as_py()

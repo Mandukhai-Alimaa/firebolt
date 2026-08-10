@@ -7,6 +7,7 @@ import uuid
 import adbc_driver_manager
 import pyarrow as pa
 import pytest
+from adbc_driver_manager import dbapi
 
 from helpers import firebolt_engine
 from helpers.mock_firebolt_server import MockFireboltServer
@@ -45,6 +46,52 @@ def conn(server_url):
 
 
 @pytest.fixture
+def dbapi_conn(server_url):
+    """A DBAPI-style Connection that opens its own AdbcDatabase + AdbcConnection.
+
+    autocommit=True so each adbc_ingest() commits immediately and the data
+    becomes visible to the read fixtures (which use a separate AdbcConnection).
+    """
+    with dbapi.connect(
+        driver=ADBC_DRIVER_PATH, db_kwargs={"uri": server_url}, autocommit=True
+    ) as c:
+        yield c
+
+
+@pytest.fixture
+def cursor(dbapi_conn):
+    """A DBAPI Cursor — the public-API path (Cursor.adbc_ingest, execute, ...)."""
+    with dbapi_conn.cursor() as cur:
+        yield cur
+
+
+@pytest.fixture
+def ingest(conn):
+    """Return a callable driving bulk ingest through the low-level AdbcStatement
+    API, mirroring what the dbapi Cursor.adbc_ingest() wrapper does internally.
+    Used to pin the C++ driver against the option set the wrapper sends."""
+
+    def _ingest(table_name, data, mode="adbc.ingest.mode.create", *, catalog=None, db_schema=None):
+        options = {
+            adbc_driver_manager.StatementOptions.INGEST_MODE.value: mode,
+            adbc_driver_manager.StatementOptions.INGEST_TARGET_TABLE.value: table_name,
+        }
+        if catalog is not None:
+            options[adbc_driver_manager.StatementOptions.INGEST_TARGET_CATALOG.value] = catalog
+        if db_schema is not None:
+            options[adbc_driver_manager.StatementOptions.INGEST_TARGET_DB_SCHEMA.value] = db_schema
+
+        with adbc_driver_manager.AdbcStatement(conn) as stmt:
+            stmt.set_options(**options)
+            # AdbcStatement.bind_stream accepts the ArrowArrayStream PyCapsule
+            # produced by pyarrow's __arrow_c_stream__ method.
+            stmt.bind_stream(data.__arrow_c_stream__())
+            stmt.execute_update()
+
+    return _ingest
+
+
+@pytest.fixture
 def run_query(conn):
     """Return a callable that runs SQL and returns a pyarrow.Table."""
 
@@ -61,6 +108,15 @@ def run_query(conn):
 def table_name() -> str:
     """A unique table name for the duration of one test."""
     return f"adbc_test_{uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture
+def scratch_table(run_query, table_name: str) -> str:
+    """A unique table name that is dropped on teardown, whether or not the test
+    created it.  For tests that produce the table themselves (e.g. create-mode
+    ingest) and so cannot use `temp_table`'s fixed schema."""
+    yield table_name
+    run_query(f"DROP TABLE IF EXISTS {table_name}")
 
 
 @pytest.fixture

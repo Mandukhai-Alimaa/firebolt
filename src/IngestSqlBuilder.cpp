@@ -11,6 +11,31 @@ namespace firebolt::adbc
 namespace
 {
 
+    // Where a field definition is being rendered.
+    enum class FieldPosition
+    {
+        Column,
+        Nested,
+    };
+
+    // Append `"name" TYPE [NOT NULL]` to `out`.  Returns false if the field has no
+    // name or no Firebolt type, leaving `out` for the caller to discard.
+    bool appendFieldDefinition(std::string & out, const ArrowSchema * field, FieldPosition position)
+    {
+        if (!field || !field->name)
+            return false;
+        std::string sql_type = arrowTypeToFireboltSqlType(field);
+        if (sql_type.empty())
+            return false;
+        out += quoteIdentifier(field->name);
+        out += ' ';
+        out += sql_type;
+        const bool nullable = (field->flags & ARROW_FLAG_NULLABLE) != 0;
+        if (position == FieldPosition::Column && !nullable)
+            out += " NOT NULL";
+        return true;
+    }
+
     AdbcStatusCode setError(AdbcError * e, AdbcStatusCode code, const std::string & msg)
     {
         if (e)
@@ -131,23 +156,16 @@ std::string arrowTypeToFireboltSqlType(const ArrowSchema * field)
             return "ARRAY(" + inner + ")";
         }
         case NANOARROW_TYPE_STRUCT: {
+            // Firebolt has no zero-field STRUCT — "STRUCT()" is a syntax error.
+            if (field->n_children == 0)
+                return {};
             std::string s = "STRUCT(";
             for (int64_t i = 0; i < field->n_children; ++i)
             {
-                const ArrowSchema * child = field->children[i];
-                if (!child)
-                    return {};
-                std::string child_type = arrowTypeToFireboltSqlType(child);
-                if (child_type.empty())
-                    return {};
                 if (i > 0)
                     s += ", ";
-                s += quoteIdentifier(child->name ? child->name : "");
-                s += ' ';
-                s += child_type;
-                bool nullable = (child->flags & ARROW_FLAG_NULLABLE) != 0;
-                if (!nullable)
-                    s += " NOT NULL";
+                if (!appendFieldDefinition(s, field->children[i], FieldPosition::Nested))
+                    return {};
             }
             s += ')';
             return s;
@@ -164,20 +182,10 @@ std::string buildCreateTableColumns(const ArrowSchema * top_level_schema)
     std::string out;
     for (int64_t i = 0; i < top_level_schema->n_children; ++i)
     {
-        const ArrowSchema * child = top_level_schema->children[i];
-        if (!child || !child->name)
-            return {};
-        std::string sql_type = arrowTypeToFireboltSqlType(child);
-        if (sql_type.empty())
-            return {};
         if (i > 0)
             out += ", ";
-        out += quoteIdentifier(child->name);
-        out += ' ';
-        out += sql_type;
-        bool nullable = (child->flags & ARROW_FLAG_NULLABLE) != 0;
-        if (!nullable)
-            out += " NOT NULL";
+        if (!appendFieldDefinition(out, top_level_schema->children[i], FieldPosition::Column))
+            return {};
     }
     return out;
 }

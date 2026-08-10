@@ -1,0 +1,194 @@
+# Options reference
+
+Every option this driver reads, at all three ADBC levels. Anything not listed
+here is not consumed by the driver — see [Unknown options](#unknown-options) for
+what happens to it.
+
+Options are set through whichever API your driver manager exposes. In Python:
+
+```python
+# Database-level options
+dbapi.connect(driver=DRIVER, db_kwargs={"uri": ..., "adbc.firebolt.database": ...})
+
+# Connection-level options
+conn.adbc_connection.set_options(**{"adbc.firebolt.token": "..."})
+
+# Statement-level options
+stmt.set_options(**{"adbc.ingest.target_table": "events"})
+```
+
+---
+
+## Database options
+
+Set on `AdbcDatabase` before `AdbcDatabaseInit` (`db_kwargs` in Python).
+
+| Key | Required | Default | Meaning |
+|-----|----------|---------|---------|
+| `uri` | **yes** | — | The engine's HTTP endpoint, e.g. `http://localhost:3473`. Validated at `Init`: it must start with `http://` or `https://`, and `https://` is rejected outright by a build without TLS. Used verbatim, so a path is preserved (`http://host/query` stays `/query`) and query parameters are appended to whatever is already there. |
+| `adbc.firebolt.token` | no | none | Bearer token sent as `Authorization: Bearer <token>`. Omit it entirely for an engine with authentication disabled — no header is sent. See [docs/authentication.md](docs/authentication.md); this key is a stopgap and is going away. |
+| `adbc.firebolt.database` | no | server default | Database name, appended to every request URL as `database=<value>`. |
+| `adbc.firebolt.timeout_sec` | no | `0` | Whole seconds; the total request timeout (libcurl `CURLOPT_TIMEOUT`). `0` disables it. Rejected with `ADBC_STATUS_INVALID_ARGUMENT` if not a non-negative integer. |
+
+Errors:
+
+| Situation | Status |
+|-----------|--------|
+| `uri` missing at `Init` | `ADBC_STATUS_INVALID_ARGUMENT` |
+| `uri` has no scheme, or a scheme other than http/https | `ADBC_STATUS_INVALID_ARGUMENT` |
+| `uri` is `https://` on a build without TLS | `ADBC_STATUS_INVALID_ARGUMENT` |
+| `adbc.firebolt.timeout_sec` not a non-negative integer | `ADBC_STATUS_INVALID_ARGUMENT` |
+| unknown `adbc.firebolt.*` key | `ADBC_STATUS_NOT_FOUND` |
+
+All of these surface when you **open** the database, not from the individual
+option call — so in Python they are raised by `dbapi.connect(...)`, which is where
+you passed `db_kwargs` anyway. (The reason is in
+[CLAUDE.md](CLAUDE.md): the driver manager replays pre-`Init` options from inside
+`AdbcDatabaseInit`, and its failure path there has a one-byte heap overflow that
+aborts the process, so the driver keeps out of it.) An option set *after* the
+database is open is refused on the spot.
+
+## Connection options
+
+Set on `AdbcConnection`, before or after `AdbcConnectionInit`.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `adbc.connection.autocommit` | `true` | `false` starts explicit transactions: the driver issues `BEGIN` lazily before the first statement, and you then drive `AdbcConnectionCommit` / `AdbcConnectionRollback`. Setting it back to `true` while a transaction is open commits that transaction first. |
+| `adbc.firebolt.token` | inherited from the database | Per-connection bearer token. Two connections sharing one `AdbcDatabase` keep independent identities; setting it here never mutates the database default or the other connection. It is deliberately kept out of the session parameters below, because those are URL-encoded into every request line and would put the token in proxy and server access logs. May be set between `New` and `Init` — `Init` will not overwrite it. |
+| *any other key* | — | Stored as a **session parameter** and appended to the query URL of every subsequent request as `<key>=<value>` (URL-encoded). This is how you pass Firebolt query settings through. |
+
+Since unknown connection keys become session parameters, a typo here does not
+raise — it is sent to the server, which may reject it or ignore it. This differs
+on purpose from database options, where an unrecognised `adbc.firebolt.*` key is
+an error.
+
+### Server-driven session state
+
+The server can change the connection's session parameters through response
+headers, which the driver applies **only when the response was a success** — a
+4xx/5xx body can come from a proxy or an attacker, so its session hints are not
+trusted (`src/HttpClient.cpp`, `applySessionUpdatesIfSuccess`).
+
+| Response header | Effect |
+|-----------------|--------|
+| `Firebolt-Update-Parameters` | Merge the listed `k=v` pairs into the session parameters. |
+| `Firebolt-Remove-Parameters` | Drop the listed keys. |
+| `Firebolt-Reset-Session` | Clear all session parameters. |
+
+## Statement options
+
+Set on `AdbcStatement`. All of these configure bulk ingest; the driver has no
+other statement options.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `adbc.ingest.target_table` | — | Target table. Setting it switches `ExecuteUpdate`/`ExecuteQuery` to the ingest path, which generates `INSERT INTO <target> (<cols>) SELECT * FROM read_arrow('upload://data.arrow')` and uploads the bound Arrow data as a multipart request. |
+| `adbc.ingest.target_catalog` | — | Catalog qualifier for the target table. |
+| `adbc.ingest.target_db_schema` | — | Schema qualifier for the target table. |
+| `adbc.ingest.mode` | `adbc.ingest.mode.create` | One of `adbc.ingest.mode.append`, `.create`, `.replace`, `.create_append`. Any other value is `ADBC_STATUS_INVALID_ARGUMENT`. |
+| `adbc.ingest.temporary` | — | Only `false` (or empty) is accepted, as a no-op — the Python dbapi layer sends it by default. `true` returns `ADBC_STATUS_NOT_IMPLEMENTED`: Firebolt has no session-temporary tables. |
+
+All identifiers — table, catalog, schema, and every column and struct field name
+— are double-quoted with embedded `"` doubled before being interpolated into
+generated SQL (`quoteIdentifier` in `src/IngestSqlBuilder.cpp`).
+
+### What each ingest mode emits
+
+| Mode | Statements, in order |
+|------|----------------------|
+| `append` | `INSERT INTO …` |
+| `create` | `CREATE TABLE …`, `INSERT INTO …` |
+| `create_append` | `CREATE TABLE IF NOT EXISTS …`, `INSERT INTO …` |
+| `replace` | `DROP TABLE IF EXISTS …`, `CREATE TABLE …`, `INSERT INTO …` |
+
+Each statement is a separate HTTP request — Firebolt rejects several statements
+in one body. The create-style modes need the bound schema to synthesise the DDL,
+so binding data with no schema fails with `ADBC_STATUS_INVALID_STATE`.
+
+If an ingest target is set but no data was bound, the driver fails with
+`ADBC_STATUS_INVALID_STATE` **before** issuing any statement. Without that gate,
+`replace` would drop the existing table and then have nothing to insert.
+
+### Arrow → Firebolt types used for generated DDL
+
+From `arrowTypeToFireboltSqlType` in `src/IngestSqlBuilder.cpp`. This is the
+mapping used to generate DDL for create-style ingest; reading results is
+unaffected.
+
+**A mapping existing here does not mean the ingest succeeds.** The DDL is only the
+first of three steps — the Arrow data still has to be serialised to IPC by
+nanoarrow and then read back by the server, and some types fail at one of those.
+The verified end-to-end results are the
+[Arrow to Database table in the README](README.md#arrow-to-database); use that
+table to decide what to send. This one explains what the driver *emits*.
+
+| Arrow type | Emitted Firebolt type | Ingest works |
+|------------|----------------------|--------------|
+| `bool` | `BOOLEAN` | yes |
+| `int8`, `int16`, `int32`, `uint8`, `uint16` | `INT` | yes |
+| `int64`, `uint32` | `BIGINT` | yes |
+| `uint64` | `BIGINT` | only up to `int64` max — `BIGINT` is signed |
+| `float32` | `REAL` | yes |
+| `float64` | `DOUBLE PRECISION` | yes |
+| `string`, `large_string` | `TEXT` | yes |
+| `string_view` | `TEXT` | **no** — nanoarrow's IPC writer cannot encode view layouts |
+| `binary`, `large_binary`, `fixed_size_binary` | `BYTEA` | yes |
+| `binary_view` | `BYTEA` | **no** — same IPC limitation |
+| `date32`, `date64` | `DATE` | yes |
+| `timestamp` without timezone | `TIMESTAMPNTZ` | yes, all units |
+| `timestamp` with timezone | `TIMESTAMPTZ` | yes; normalised to UTC, offset not retained |
+| `decimal128` | `DECIMAL(p, s)` | yes, precision ≤ 38 |
+| `decimal32`, `decimal64`, `decimal256` | `DECIMAL(p, s)` | **no** — the server cannot read these Arrow layouts |
+| `list`, `large_list` | `ARRAY(<inner>)`, recursive | yes |
+| `fixed_size_list` | `ARRAY(<inner>)` | **no** — the server rejects the schema |
+| `struct` | `STRUCT("field" TYPE, …)`, recursive | yes |
+
+Anything else — `map`, `null`, `duration`, intervals, unions, `time32`/`time64` —
+has no mapping, and create-style ingest fails with
+`ADBC_STATUS_NOT_IMPLEMENTED` rather than sending DDL the server would reject.
+`dictionary` has no mapping either and additionally cannot be IPC-encoded.
+
+Two nullability rules, both forced by Firebolt:
+
+- A non-nullable **column** is emitted as `NOT NULL`.
+- A non-nullable **struct field** is widened to nullable, because Firebolt
+  rejects `STRUCT(… NOT NULL)` with "STRUCT fields have to be nullable".
+- A zero-field struct has no mapping at all: there is no `STRUCT()` in Firebolt,
+  so the ingest fails instead of producing a syntax error at the server.
+
+## Unknown options
+
+| Level | Unknown key behaviour |
+|-------|----------------------|
+| Database | `adbc.firebolt.*` → `ADBC_STATUS_NOT_FOUND`. Any other key is accepted and ignored, because the driver manager sets some itself and callers pass parameters this driver does not consume yet. |
+| Connection | Accepted, and forwarded to the server as a session parameter. |
+| Statement | Accepted and ignored. |
+
+---
+
+## Names that are going to change
+
+The driver's option names predate
+[`sdk-authentication.md`](https://github.com/firebolt-db/packdb/blob/main/specs/sdk-authentication.md),
+which standardises one parameter set across every Firebolt SDK — canonical
+names, types, and defaults live in
+[`specs/schemas/connection-parameters.v1.json`](https://github.com/firebolt-db/packdb/blob/main/specs/schemas/connection-parameters.v1.json).
+This driver has not migrated yet. The table below is so you can tell which of
+today's names are stable and which are already superseded.
+
+| Today | Canonical | Note |
+|-------|-----------|------|
+| `uri` | `host` | Plus `ssl_mode` for the transport, instead of encoding it in the scheme. |
+| `adbc.firebolt.database` | `database` | Rename only. |
+| `adbc.firebolt.timeout_sec` | `query_timeout` | Rename only. |
+| `adbc.firebolt.token` | *(none)* | The spec has no connection field for a raw JWT: it comes from the `FIREBOLT_TOKEN` environment variable. This key will be removed. |
+| — | `username` / `password` | OAuth `client_id` / `client_secret` for the `client_credentials` grant. Not implemented yet. |
+| — | `engine` | Engine selector, sent per request. Not implemented yet. |
+| — | `authorization_server` | Which discovered authorization server to use. Not implemented yet. |
+| — | `ssl_mode`, `ssl_certificate_path` | Transport security. Not implemented — this build is plaintext-only. |
+| — | `use_token_cache`, `connection_timeout`, `max_retries`, `user_agent` | Not implemented yet. |
+
+When the migration lands, the current names are replaced rather than aliased.
+Nothing outside this repository consumes them yet, and carrying two spellings
+forever is worse than one rename before the first public release.

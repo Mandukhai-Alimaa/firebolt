@@ -1,0 +1,39 @@
+# ADBC driver manifest for the Firebolt driver.
+#
+# Installing this file lets callers say `driver="firebolt"` instead of passing
+# an absolute path to libfirebolt_adbc.so:
+#
+#     import adbc_driver_manager.dbapi as dbapi
+#     dbapi.connect(driver="firebolt", db_kwargs={"uri": "http://localhost:3473"})
+#
+# Install it under any directory the driver manager searches, naming the file
+# after the driver (`firebolt.toml` → `driver="firebolt"`):
+#
+#   * a directory listed in the ADBC_DRIVER_PATH environment variable
+#   * ${XDG_CONFIG_HOME:-~/.config}/adbc/drivers   (per user)
+#   * /etc/adbc/drivers                            (system wide)
+#
+# On macOS the per-user directory is ~/Library/Application Support/ADBC/Drivers
+# and the system one is /Library/Application Support/ADBC/Drivers, but this
+# driver has no macOS build — see the README's platform support table.
+#
+# Requires a driver manager with manifest support (adbc-driver-manager >= 1.5).
+#
+# EDIT THE PATHS BELOW: they must be absolute paths to the .so you downloaded.
+# Relative paths are resolved against the process working directory, not
+# against this file, so they are rarely what you want.
+
+name = "Firebolt"
+manifest_version = 1
+version = "0.1.0"
+source = "https://github.com/firebolt-db/firebolt-adbc"
+
+[Driver]
+# The driver exports the standard `AdbcDriverInit` symbol, which is what the
+# driver manager looks for by default, so no `entrypoint` is needed here.
+# It also exports `FireboltAdbcDriverInit` as an alias if you want to be
+# explicit: entrypoint = "FireboltAdbcDriverInit"
+
+[Driver.shared]
+linux_amd64 = "/usr/local/lib/libfirebolt_adbc.so"
+linux_arm64 = "/usr/local/lib/libfirebolt_adbc.so"

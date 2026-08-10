@@ -15,7 +15,9 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <strings.h>
 
 #include <curl/curl.h>
 
@@ -55,6 +57,23 @@ static AdbcStatusCode HttpRespToStatus(const HttpResponse & resp, AdbcError * er
     if (resp.http_code >= 500)
         return SetError(error, ADBC_STATUS_IO, "HTTP " + std::to_string(resp.http_code) + ": " + resp.error_message);
     return ADBC_STATUS_OK;
+}
+
+// Case-insensitive check that `url` begins with `scheme` (URI schemes are
+// case-insensitive per RFC 3986 §3.1).
+static bool hasSchemePrefix(const std::string & url, const char * scheme)
+{
+    const size_t n = strlen(scheme);
+    return url.size() >= n && strncasecmp(url.c_str(), scheme, n) == 0;
+}
+
+// Whether the libcurl we are linked against can speak TLS.  Asked of libcurl
+// rather than tracked as a build-time define so the answer always matches the
+// library actually loaded.
+static bool curlSupportsTls()
+{
+    const curl_version_info_data * v = curl_version_info(CURLVERSION_NOW);
+    return v != nullptr && (v->features & CURL_VERSION_SSL) != 0;
 }
 
 // Apply server-advertised session updates only when the response succeeded.
@@ -157,6 +176,33 @@ static AdbcStatusCode DatabaseNew(AdbcDatabase * db, AdbcError * error)
     }
 }
 
+// Refuse an option, but not necessarily right now.
+//
+// A driver manager collects options set before the driver is even loaded and
+// replays them from inside AdbcDatabaseInit.  The failure path of that replay in
+// adbc-driver-manager (through at least 1.8.0) copies the driver's error with
+//
+//     error->message = new char[strlen(src)];  error->message[strlen(src)] = '\0';
+//
+// — a one-byte heap overflow that aborts the host process.  No driver had
+// exercised it, because drivers conventionally accept and discard unknown
+// options.  Reporting from DatabaseInit instead keeps the diagnostic and avoids
+// that path: the manager forwards Init's error struct through untouched.
+//
+// Once the database is initialised there is no replay involved, so an option set
+// after that point is refused immediately.
+static AdbcStatusCode RejectOption(FireboltDatabase * fdb, AdbcError * error, AdbcStatusCode code, std::string message)
+{
+    if (fdb->initialized)
+        return SetError(error, code, message);
+    if (fdb->option_error.empty())
+    {
+        fdb->option_error = std::move(message);
+        fdb->option_error_code = code;
+    }
+    return ADBC_STATUS_OK;
+}
+
 static AdbcStatusCode DatabaseSetOption(AdbcDatabase * db, const char * key, const char * value, AdbcError * error)
 {
     if (!db || !db->private_data)
@@ -173,8 +219,45 @@ static AdbcStatusCode DatabaseSetOption(AdbcDatabase * db, const char * key, con
     else if (k == "adbc.firebolt.database")
         fdb->database = v;
     else if (k == "adbc.firebolt.timeout_sec")
-        fdb->timeout_sec = std::stol(v);
-    // Unknown options are silently ignored.
+    {
+        // std::stol throws on non-numeric and out-of-range input.  Letting that
+        // propagate would unwind through the C ABI into a driver manager with no
+        // handler, aborting the host process (a Python interpreter, an R session)
+        // over a mistyped option.
+        long parsed = 0;
+        try
+        {
+            size_t consumed = 0;
+            parsed = std::stol(v, &consumed);
+            if (consumed != v.size())
+                throw std::invalid_argument("trailing characters");
+        }
+        catch (const std::exception &)
+        {
+            return RejectOption(
+                fdb,
+                error,
+                ADBC_STATUS_INVALID_ARGUMENT,
+                "Option 'adbc.firebolt.timeout_sec' must be a whole number of seconds (0 disables the timeout); got '" + v + "'");
+        }
+        if (parsed < 0)
+            return RejectOption(
+                fdb,
+                error,
+                ADBC_STATUS_INVALID_ARGUMENT,
+                "Option 'adbc.firebolt.timeout_sec' must not be negative (0 disables the timeout); got '" + v + "'");
+        fdb->timeout_sec = parsed;
+    }
+    else if (k.rfind("adbc.firebolt.", 0) == 0)
+    {
+        // A misspelled driver option is a configuration bug.  Accepting it
+        // silently produced connections that used the server's defaults with no
+        // diagnostic anywhere.
+        return RejectOption(fdb, error, ADBC_STATUS_NOT_FOUND, "Unknown Firebolt database option '" + k + "'");
+    }
+    // Keys outside the adbc.firebolt.* namespace are accepted and ignored: the
+    // driver manager sets some of them itself, and callers pass connection
+    // parameters this driver does not consume yet.
     return ADBC_STATUS_OK;
 }
 
@@ -183,8 +266,32 @@ static AdbcStatusCode DatabaseInit(AdbcDatabase * db, AdbcError * error)
     if (!db || !db->private_data)
         return SetError(error, ADBC_STATUS_INVALID_STATE, "Database not initialized");
     auto * fdb = static_cast<FireboltDatabase *>(db->private_data);
+
+    // An option rejected before Init is reported here — see RejectOption.
+    if (!fdb->option_error.empty())
+        return SetError(error, fdb->option_error_code, fdb->option_error);
+
     if (fdb->url.empty())
         return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Database 'uri' option is required");
+
+    // Validate the endpoint here rather than letting libcurl reject it on the
+    // first query, where the failure reads as a network error ("Unsupported
+    // protocol") with nothing pointing back at the option that caused it.
+    const bool is_http = hasSchemePrefix(fdb->url, "http://");
+    const bool is_https = hasSchemePrefix(fdb->url, "https://");
+    if (!is_http && !is_https)
+        return SetError(
+            error,
+            ADBC_STATUS_INVALID_ARGUMENT,
+            "Database 'uri' must start with http:// or https://; got '" + fdb->url
+                + "'. Pass the engine's HTTP endpoint, for example http://localhost:3473");
+    if (is_https && !curlSupportsTls())
+        return SetError(
+            error,
+            ADBC_STATUS_INVALID_ARGUMENT,
+            "Database 'uri' is https:// but this driver was built without TLS support, so it can only reach plaintext http:// "
+            "endpoints. Use an http:// endpoint, or rebuild the driver with -DWITH_SSL=ON.");
+
     initCurl();
     fdb->initialized = true;
     return ADBC_STATUS_OK;
@@ -622,6 +729,18 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
                 error,
                 ADBC_STATUS_INVALID_STATE,
                 "Ingest target set but no data bound; call Bind/BindStream before ExecuteQuery");
+
+        // Data bound with no ingest target.  Firebolt's HTTP interface has no
+        // query-parameter binding, and the multipart branch below keys on
+        // ipc_bytes alone — so this would otherwise POST the caller's SQL with a
+        // stray data.arrow part and fail server-side with an opaque upload
+        // error.  This is the shape `cursor.execute(sql, parameters)` produces.
+        if (!is_ingest && fs->ingest && !fs->ingest->ipc_bytes.empty())
+            return SetError(
+                error,
+                ADBC_STATUS_NOT_IMPLEMENTED,
+                "Query parameter binding is not supported. Bind/BindStream is only valid for bulk ingest, with the "
+                "ingest target-table option set; inline literals into the SQL instead.");
 
         std::vector<std::string> pre_sql;
         if (is_ingest)

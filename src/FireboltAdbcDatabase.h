@@ -1,5 +1,7 @@
 #pragma once
 
+#include "adbc.h"
+
 #include <string>
 
 namespace firebolt::adbc
@@ -12,6 +14,11 @@ struct FireboltDatabase
     std::string database; // "adbc.firebolt.database" — database name (optional)
     long timeout_sec = 0; // "adbc.firebolt.timeout_sec" — 0 means no timeout (libcurl default)
     bool initialized = false;
+
+    // First rejected option, held until DatabaseInit reports it.  See the note in
+    // DatabaseSetOption for why a bad option is not refused on the spot.
+    std::string option_error;
+    AdbcStatusCode option_error_code = ADBC_STATUS_OK;
 };
 
 } // namespace firebolt::adbc
