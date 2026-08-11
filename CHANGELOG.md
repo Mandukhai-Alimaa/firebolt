@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-11
+
 ### Added
 
 - **Query parameter binding.** `cursor.execute(sql, params)` and
@@ -48,5 +50,6 @@ See [README.md](README.md#supported-today). In short: plaintext `http://` only
 pre-obtained bearer token, no discovery-based OAuth, Linux only, and no
 parameterized queries.
 
-[Unreleased]: https://github.com/firebolt-db/firebolt-adbc/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/firebolt-db/firebolt-adbc/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/firebolt-db/firebolt-adbc/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/firebolt-db/firebolt-adbc/releases/tag/v0.1.0
