@@ -39,8 +39,7 @@ struct HttpResponse
 //
 // Defined inline so unit tests can call it without re-exporting symbols from the
 // hidden-visibility shared library.
-inline bool applySessionUpdatesIfSuccess(
-    std::unordered_map<std::string, std::string> & session_params, const HttpResponse & resp)
+inline bool applySessionUpdatesIfSuccess(std::unordered_map<std::string, std::string> & session_params, const HttpResponse & resp)
 {
     if (!resp.isSuccess())
         return false;

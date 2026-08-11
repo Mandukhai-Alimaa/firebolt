@@ -1,10 +1,12 @@
 #include "ArrowIpcStream.h"
+#include "DescribeParameters.h"
 #include "FireboltAdbcConnection.h"
 #include "FireboltAdbcDatabase.h"
 #include "FireboltAdbcMetadata.h"
 #include "FireboltAdbcStatement.h"
 #include "HttpClient.h"
 #include "IngestSqlBuilder.h"
+#include "QueryParameters.h"
 #include "ScopeGuard.h"
 #include "adbc.h"
 
@@ -85,6 +87,22 @@ static void ApplySessionUpdates(FireboltConnection * conn, const HttpResponse & 
     applySessionUpdatesIfSuccess(conn->session_params, resp);
 }
 
+// ADBC 1.1.0 predates this option, so the vendored adbc.h does not declare it, but
+// driver managers send it (adbc_driver_manager 1.8.0,
+// StatementOptions.BIND_BY_NAME).
+#define FIREBOLT_ADBC_STATEMENT_OPTION_BIND_BY_NAME "adbc.statement.bind_by_name"
+
+// Firebolt query settings the driver sets per request.  They travel as URL query
+// parameters, the same channel session parameters use.
+static constexpr const char * QUERY_PARAMETERS_SETTING = "query_parameters";
+static constexpr const char * EXECUTION_MODE_SETTING = "execution_mode";
+static constexpr const char * DESCRIBE_PARAMETERS_MODE = "describe_parameters";
+
+// Session parameters the engine uses to keep a statement inside an open
+// transaction.  Set by the server through Firebolt-Update-Parameters after BEGIN.
+static constexpr const char * TRANSACTION_ID_PARAM = "transaction_id";
+static constexpr const char * TRANSACTION_SEQUENCE_PARAM = "transaction_sequence_id";
+
 // ============================================================
 // curl global init / cleanup (once per process)
 // ============================================================
@@ -155,6 +173,37 @@ static std::string SerializeArrayStream(ArrowArrayStream * stream, std::vector<u
     out.assign(buf.data, buf.data + buf.size_bytes);
     ArrowBufferReset(&buf);
     return {};
+}
+
+// Encode the bound batches as the Arrow IPC stream the multipart ingest uploads as
+// data.arrow.  The ingest path is the only caller; query parameters are read
+// straight out of the arrays.
+//
+// Consumes the batches — ArrowBasicArrayStreamSetArray takes ownership of each, and
+// the payload is single-use.  The stream takes ownership of its schema too, hence
+// the copy: buildIngestSql still needs the statement's own.
+static AdbcStatusCode SerializeBoundData(BoundData & bound, std::vector<uint8_t> & out, AdbcError * error)
+{
+    // Reachable in append mode, the one mode buildIngestSql needs no schema for.
+    if (!bound.schema->release)
+        return SetError(error, ADBC_STATUS_INVALID_STATE, "Bound data has no schema; nothing can be uploaded");
+
+    nanoarrow::UniqueSchema schema_copy;
+    if (ArrowSchemaDeepCopy(bound.schema.get(), schema_copy.get()) != 0)
+        return SetError(error, ADBC_STATUS_INTERNAL, "ArrowSchemaDeepCopy failed");
+
+    nanoarrow::UniqueArrayStream stream;
+    if (ArrowBasicArrayStreamInit(stream.get(), schema_copy.get(), static_cast<int64_t>(bound.batches.size())) != 0)
+        return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "ArrowBasicArrayStreamInit failed");
+
+    for (size_t i = 0; i < bound.batches.size(); ++i)
+        ArrowBasicArrayStreamSetArray(stream.get(), static_cast<int64_t>(i), bound.batches[i].get());
+    bound.batches.clear();
+
+    std::string err = SerializeArrayStream(stream.get(), out);
+    if (!err.empty())
+        return SetError(error, ADBC_STATUS_INTERNAL, err);
+    return ADBC_STATUS_OK;
 }
 
 // ============================================================
@@ -546,9 +595,9 @@ static AdbcStatusCode StatementSetSqlQuery(AdbcStatement * stmt, const char * qu
         return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Query is null");
     auto * fs = static_cast<FireboltStatement *>(stmt->private_data);
     fs->sql = query;
-    // Bound ingest payload is tied to the previous SQL and must be dropped
-    // when the statement text changes.
-    fs->ingest.reset();
+    // Bound payload is tied to the previous SQL and must be dropped when the
+    // statement text changes.
+    fs->bound.reset();
     return ADBC_STATUS_OK;
 }
 
@@ -557,11 +606,19 @@ static AdbcStatusCode StatementSetSubstraitPlan(AdbcStatement * /*stmt*/, const 
     return SetError(error, ADBC_STATUS_NOT_IMPLEMENTED, "Substrait plans not supported");
 }
 
+// Issues no request: Firebolt has no server-side prepare, a parameterised statement
+// being sent whole every time with `$N` resolved from the `query_parameters` setting.
+// ADBC allows this — Prepare is optional on the way to execution, promises only that
+// the statement is reusable, and leaves parameter metadata to GetParameterSchema.  A
+// round-trip here would double the request count of every `cursor.execute()`, which
+// calls Prepare whenever the query text changes.
+//
+// Returns OK rather than NOT_IMPLEMENTED because the statement is in fact reusable
+// with new parameters, which is what Prepare promises.
 static AdbcStatusCode StatementPrepare(AdbcStatement * stmt, AdbcError * error)
 {
     if (!stmt || !stmt->private_data)
         return SetError(error, ADBC_STATUS_INVALID_STATE, "Statement not initialized");
-    // No-op: Firebolt HTTP has no server-side prepare
     return ADBC_STATUS_OK;
 }
 
@@ -571,40 +628,45 @@ static AdbcStatusCode StatementPrepare(AdbcStatement * stmt, AdbcError * error)
 // INSERT statements with column names and types.
 static AdbcStatusCode CaptureBoundSchema(FireboltStatement * fs, const ArrowSchema * schema, AdbcError * error)
 {
-    fs->ingest->schema.reset();
+    fs->bound->schema.reset();
     if (!schema || !schema->release)
         return ADBC_STATUS_OK;
-    if (ArrowSchemaDeepCopy(schema, fs->ingest->schema.get()) != 0)
+    if (ArrowSchemaDeepCopy(schema, fs->bound->schema.get()) != 0)
         return SetError(error, ADBC_STATUS_INTERNAL, "ArrowSchemaDeepCopy failed");
     return ADBC_STATUS_OK;
 }
 
+// Both Bind entry points take ownership of what they are handed; whatever is not
+// retained is released here.
 static AdbcStatusCode StatementBind(AdbcStatement * stmt, ArrowArray * values, ArrowSchema * schema, AdbcError * error)
 {
     if (!stmt || !stmt->private_data)
         return SetError(error, ADBC_STATUS_INVALID_STATE, "Statement not initialized");
     auto * fs = static_cast<FireboltStatement *>(stmt->private_data);
 
-    fs->initAndGetIngestState();
+    auto & bound = fs->initAndGetBoundData();
+    bound.batches.clear();
+    bound.data_bound = false;
 
-    // Deep-copy the schema before the stream takes ownership.
+    // The statement keeps a deep copy of the schema, so the caller's goes either way;
+    // the array is moved in.
     AdbcStatusCode capture_rc = CaptureBoundSchema(fs, schema, error);
+    if (schema && schema->release)
+        schema->release(schema);
     if (capture_rc != ADBC_STATUS_OK)
+    {
+        if (values && values->release)
+            values->release(values);
         return capture_rc;
+    }
 
-    // Wrap the single record batch in a one-shot ArrowArrayStream, then serialise.
-    // ArrowBasicArrayStreamInit(stream, schema, n_arrays) takes ownership of schema.
-    // ArrowBasicArrayStreamSetArray(stream, i, array) takes ownership of array (returns void).
-    nanoarrow::UniqueArrayStream stream;
-    int rc = ArrowBasicArrayStreamInit(stream.get(), schema, 1);
-    if (rc != 0)
-        return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "ArrowBasicArrayStreamInit failed");
-
-    ArrowBasicArrayStreamSetArray(stream.get(), 0, values);
-
-    std::string err = SerializeArrayStream(stream.get(), fs->ingest->ipc_bytes);
-    if (!err.empty())
-        return SetError(error, ADBC_STATUS_INTERNAL, err);
+    if (values && values->release)
+    {
+        nanoarrow::UniqueArray batch;
+        ArrowArrayMove(values, batch.get());
+        bound.batches.push_back(std::move(batch));
+        bound.data_bound = true;
+    }
 
     return ADBC_STATUS_OK;
 }
@@ -615,14 +677,21 @@ static AdbcStatusCode StatementBindStream(AdbcStatement * stmt, ArrowArrayStream
         return SetError(error, ADBC_STATUS_INVALID_STATE, "Statement not initialized");
     auto * fs = static_cast<FireboltStatement *>(stmt->private_data);
 
-    fs->initAndGetIngestState();
+    auto & bound = fs->initAndGetBoundData();
+    bound.batches.clear();
+    bound.data_bound = false;
 
-    // Capture the stream schema (deep-copied) before consuming the stream.
-    fs->ingest->schema.reset();
-    if (stream && stream->get_schema)
+    // The driver owns the stream from here on, including on every failure path.
+    nanoarrow::UniqueArrayStream owned_stream;
+    if (stream && stream->release)
+        ArrowArrayStreamMove(stream, owned_stream.get());
+
+    // Capture the stream schema (deep-copied) before draining the stream.
+    bound.schema.reset();
+    if (owned_stream->release && owned_stream->get_schema)
     {
         ArrowSchema schema{};
-        if (stream->get_schema(stream, &schema) == 0)
+        if (owned_stream->get_schema(owned_stream.get(), &schema) == 0)
         {
             AdbcStatusCode capture_rc = CaptureBoundSchema(fs, &schema, error);
             if (schema.release)
@@ -632,16 +701,164 @@ static AdbcStatusCode StatementBindStream(AdbcStatement * stmt, ArrowArrayStream
         }
     }
 
-    std::string err = SerializeArrayStream(stream, fs->ingest->ipc_bytes);
-    if (!err.empty())
-        return SetError(error, ADBC_STATUS_INTERNAL, err);
+    // Drained now, not at execution: a stream is single-pass, and the caller may
+    // release its side once Bind returns.
+    while (owned_stream->release && owned_stream->get_next)
+    {
+        nanoarrow::UniqueArray batch;
+        if (owned_stream->get_next(owned_stream.get(), batch.get()) != 0)
+        {
+            const char * message = owned_stream->get_last_error ? owned_stream->get_last_error(owned_stream.get()) : nullptr;
+            bound.batches.clear();
+            return SetError(
+                error, ADBC_STATUS_INVALID_ARGUMENT, std::string("Cannot read the bound data: ") + (message ? message : "unknown error"));
+        }
+        if (!batch->release)
+            break;
+        bound.batches.push_back(std::move(batch));
+    }
+    // A stream that yielded nothing is still bound data (a zero-row create ingest
+    // uploads a schema-only payload and makes an empty table).  No stream is not.
+    bound.data_bound = owned_stream->release != nullptr;
 
     return ADBC_STATUS_OK;
 }
 
-static AdbcStatusCode StatementGetParameterSchema(AdbcStatement * /*stmt*/, ArrowSchema * /*schema*/, AdbcError * error)
+// ============================================================
+// Query parameters
+// ============================================================
+
+// Render the bound Arrow data as one `query_parameters` setting value per row — one
+// parameter set, and so one execution, each.  Reads the retained ArrowArrays
+// directly: none of this leaves as Arrow IPC, so none of it is encoded as Arrow IPC.
+static AdbcStatusCode BuildParameterSets(const BoundData & bound, bool bind_by_name, std::vector<std::string> & out, AdbcError * error)
 {
-    return SetError(error, ADBC_STATUS_NOT_IMPLEMENTED, "StatementGetParameterSchema not implemented");
+    out.clear();
+
+    const ArrowSchema * schema = bound.schema.get();
+    if (!schema->release || !schema->format || strcmp(schema->format, "+s") != 0)
+        return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Bound parameters must be a record batch");
+
+    for (const nanoarrow::UniqueArray & batch : bound.batches)
+    {
+        ArrowArrayView view{};
+        memset(&view, 0, sizeof(view));
+        FIREBOLT_SCOPE_GUARD(ArrowArrayViewReset(&view));
+
+        ArrowError arrow_error{};
+        if (ArrowArrayViewInitFromSchema(&view, schema, &arrow_error) != 0)
+            return SetError(
+                error, ADBC_STATUS_INVALID_ARGUMENT, std::string("Bound parameter schema is unsupported: ") + arrow_error.message);
+        if (ArrowArrayViewSetArray(&view, batch.get(), &arrow_error) != 0)
+            return SetError(
+                error, ADBC_STATUS_INVALID_ARGUMENT, std::string("Bound parameter data is unsupported: ") + arrow_error.message);
+
+        for (int64_t row = 0; row < batch->length; ++row)
+        {
+            std::string json;
+            std::string message;
+            AdbcStatusCode rc = buildQueryParametersJson(schema, &view, row, bind_by_name, json, message);
+            if (rc != ADBC_STATUS_OK)
+                return SetError(error, rc, message);
+            out.push_back(std::move(json));
+        }
+    }
+
+    return ADBC_STATUS_OK;
+}
+
+// ============================================================
+// Parameter metadata (execution_mode=describe_parameters)
+// ============================================================
+
+// Pull the single string cell out of a describe response.
+static AdbcStatusCode ReadDescribePayload(std::vector<uint8_t> body, std::string & out, AdbcError * error)
+{
+    nanoarrow::UniqueArrayStream stream;
+    std::string err = ExportIpcBytesAsArrowStream(std::move(body), stream.get());
+    if (!err.empty())
+        return SetError(error, ADBC_STATUS_INTERNAL, "Cannot read the describe response: " + err);
+
+    nanoarrow::UniqueSchema schema;
+    if (stream->get_schema(stream.get(), schema.get()) != 0 || schema->n_children != 1)
+        return SetError(error, ADBC_STATUS_INTERNAL, "Unexpected describe response shape");
+
+    nanoarrow::UniqueArray batch;
+    if (stream->get_next(stream.get(), batch.get()) != 0 || !batch->release || batch->length < 1)
+        return SetError(error, ADBC_STATUS_INTERNAL, "Empty describe response");
+
+    ArrowArrayView view{};
+    memset(&view, 0, sizeof(view));
+    FIREBOLT_SCOPE_GUARD(ArrowArrayViewReset(&view));
+    if (ArrowArrayViewInitFromSchema(&view, schema->children[0], nullptr) != 0
+        || ArrowArrayViewSetArray(&view, batch->children[0], nullptr) != 0)
+        return SetError(error, ADBC_STATUS_INTERNAL, "Unexpected describe response type");
+    if (ArrowArrayViewIsNull(&view, 0) || (view.storage_type != NANOARROW_TYPE_STRING && view.storage_type != NANOARROW_TYPE_LARGE_STRING))
+        return SetError(error, ADBC_STATUS_INTERNAL, "Unexpected describe response type");
+
+    ArrowStringView s = ArrowArrayViewGetStringUnsafe(&view, 0);
+    out.assign(s.data, static_cast<size_t>(s.size_bytes));
+    return ADBC_STATUS_OK;
+}
+
+// Ask the server to validate the statement and report its parameter types without
+// executing it.
+//
+// Not cached: the types come from the objects the statement names, so DDL from any
+// connection changes the answer while the text stays the same, and there is no
+// invalidation event the driver can see (dbapi re-issues SetSqlQuery only when the
+// text changes).  Asking every time costs one request on a rare explicit call —
+// GetParameterSchema is reached only from `cursor.adbc_prepare()`.
+static AdbcStatusCode Describe(FireboltStatement * fs, std::string & out_payload, AdbcError * error)
+{
+    auto * conn = fs->conn;
+
+    std::unordered_map<std::string, std::string> params = conn->session_params;
+    // Type inference must not join an open transaction, which would spend a
+    // transaction step on a statement the caller never ran.  The server's own
+    // PostgreSQL handler excludes it the same way.
+    params.erase(TRANSACTION_ID_PARAM);
+    params.erase(TRANSACTION_SEQUENCE_PARAM);
+    params[EXECUTION_MODE_SETTING] = DESCRIBE_PARAMETERS_MODE;
+
+    auto resp = conn->http->executeQuery(fs->sql, params);
+    // Session updates from the probe are not applied: it was never part of the
+    // session's transaction.
+    if (!resp.isSuccess())
+        return HttpRespToStatus(resp, error);
+
+    return ReadDescribePayload(std::move(resp.body), out_payload, error);
+}
+
+static AdbcStatusCode StatementGetParameterSchema(AdbcStatement * stmt, ArrowSchema * schema, AdbcError * error)
+{
+    if (!stmt || !stmt->private_data)
+        return SetError(error, ADBC_STATUS_INVALID_STATE, "Statement not initialized");
+    if (!schema)
+        return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Output schema is null");
+    auto * fs = static_cast<FireboltStatement *>(stmt->private_data);
+    if (!fs->conn || !fs->conn->http)
+        return SetError(error, ADBC_STATUS_INVALID_STATE, "Connection not initialized");
+    if (fs->sql.empty())
+        return SetError(error, ADBC_STATUS_INVALID_STATE, "No query has been set");
+
+    try
+    {
+        std::string payload;
+        AdbcStatusCode rc = Describe(fs, payload, error);
+        if (rc != ADBC_STATUS_OK)
+            return rc;
+
+        std::string message;
+        rc = buildParameterSchema(payload, schema, message);
+        if (rc != ADBC_STATUS_OK)
+            return SetError(error, rc, message);
+        return ADBC_STATUS_OK;
+    }
+    catch (std::exception & ex)
+    {
+        return SetError(error, ADBC_STATUS_INTERNAL, ex.what());
+    }
 }
 
 static AdbcStatusCode StatementSetOption(AdbcStatement * stmt, const char * key, const char * value, AdbcError * error)
@@ -655,24 +872,44 @@ static AdbcStatusCode StatementSetOption(AdbcStatement * stmt, const char * key,
     const std::string_view k{key};
     const std::string v(value ? value : "");
 
+    if (k == FIREBOLT_ADBC_STATEMENT_OPTION_BIND_BY_NAME)
+    {
+        // Adds a name alias per bound column, for statements reading a parameter
+        // through `param('name')`.
+        if (v == ADBC_OPTION_VALUE_ENABLED)
+            fs->bind_by_name = true;
+        else if (v == ADBC_OPTION_VALUE_DISABLED)
+            fs->bind_by_name = false;
+        else
+            return SetError(
+                error,
+                ADBC_STATUS_INVALID_ARGUMENT,
+                std::string("Invalid value for ") + FIREBOLT_ADBC_STATEMENT_OPTION_BIND_BY_NAME + ": expected \""
+                    + ADBC_OPTION_VALUE_ENABLED + "\" or \"" + ADBC_OPTION_VALUE_DISABLED + "\", got \"" + v + "\"");
+        return ADBC_STATUS_OK;
+    }
     if (k == ADBC_INGEST_OPTION_TARGET_TABLE)
     {
-        fs->initAndGetIngestState().target_table = v;
+        fs->initAndGetBoundData().target_table = v;
         return ADBC_STATUS_OK;
     }
     if (k == ADBC_INGEST_OPTION_TARGET_CATALOG)
     {
-        fs->initAndGetIngestState().target_catalog = v;
+        auto & ingest = fs->initAndGetBoundData();
+        ingest.target_catalog = v;
+        ingest.ingest_options_set = true;
         return ADBC_STATUS_OK;
     }
     if (k == ADBC_INGEST_OPTION_TARGET_DB_SCHEMA)
     {
-        fs->initAndGetIngestState().target_db_schema = v;
+        auto & ingest = fs->initAndGetBoundData();
+        ingest.target_db_schema = v;
+        ingest.ingest_options_set = true;
         return ADBC_STATUS_OK;
     }
     if (k == ADBC_INGEST_OPTION_MODE)
     {
-        auto & ingest = fs->initAndGetIngestState();
+        auto & ingest = fs->initAndGetBoundData();
         if (v == ADBC_INGEST_OPTION_MODE_APPEND)
             ingest.mode = IngestMode::Append;
         else if (v == ADBC_INGEST_OPTION_MODE_CREATE)
@@ -682,7 +919,9 @@ static AdbcStatusCode StatementSetOption(AdbcStatement * stmt, const char * key,
         else if (v == ADBC_INGEST_OPTION_MODE_CREATE_APPEND)
             ingest.mode = IngestMode::CreateAppend;
         else
+            // A rejected value changes nothing, the flag included.
             return SetError(error, ADBC_STATUS_INVALID_ARGUMENT, "Unknown ingest mode: " + v);
+        ingest.ingest_options_set = true;
         return ADBC_STATUS_OK;
     }
     if (k == ADBC_INGEST_OPTION_TEMPORARY)
@@ -711,12 +950,53 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
     if (rows_affected)
         *rows_affected = -1;
 
-    // Clear ingest state on every exit path so bound IPC payload is consumed
+    // Clear bound state on every exit path so a bound payload is consumed
     // exactly once (including failures/exceptions).
-    FIREBOLT_SCOPE_GUARD(if (fs->ingest.has_value()) fs->ingest.reset());
+    FIREBOLT_SCOPE_GUARD(if (fs->bound.has_value()) fs->bound.reset());
 
     try
     {
+        // Bound data is either a bulk-ingest payload or a set of query parameters,
+        // told apart by whether an ingest target table was set.
+        const bool has_data = fs->bound && fs->bound->data_bound;
+        const bool is_ingest = fs->bound && !fs->bound->target_table.empty();
+
+        // The target table is what routes the payload to the ingest path, so without
+        // it the other ingest options mean nothing: a mistyped or forgotten target
+        // table would otherwise become N parameterised executions of the caller's raw
+        // SQL.  Checked here, not where the options arrive, because ADBC does not
+        // order option calls — the mode may legitimately be set first.
+        if (fs->bound && !is_ingest && fs->bound->ingest_options_set)
+            return SetError(
+                error,
+                ADBC_STATUS_INVALID_STATE,
+                "Ingest options were set without " ADBC_INGEST_OPTION_TARGET_TABLE
+                "; set the target table, or unset " ADBC_INGEST_OPTION_MODE " / " ADBC_INGEST_OPTION_TARGET_CATALOG
+                " / " ADBC_INGEST_OPTION_TARGET_DB_SCHEMA " to bind the data as query parameters instead");
+
+        // One `query_parameters` value per bound row, one execution each.  Built
+        // before anything is sent, so an unrepresentable value cannot leave a
+        // transaction open behind it.
+        std::vector<std::string> param_sets;
+        if (has_data && !is_ingest)
+        {
+            AdbcStatusCode rc = BuildParameterSets(*fs->bound, fs->bind_by_name, param_sets, error);
+            if (rc != ADBC_STATUS_OK)
+                return rc;
+
+            if (param_sets.empty())
+            {
+                // Nothing bound, nothing to execute: one run with no parameters would
+                // fail on the first `$N`.
+                if (out)
+                    return SetError(
+                        error, ADBC_STATUS_INVALID_STATE, "No parameter sets were bound; a result-returning execution needs one.");
+                if (rows_affected)
+                    *rows_affected = 0;
+                return ADBC_STATUS_OK;
+            }
+        }
+
         // Lazy BEGIN: start a transaction on the first statement when autocommit is off.
         if (!conn->autocommit && !conn->in_transaction)
         {
@@ -726,39 +1006,33 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
             conn->in_transaction = true;
         }
 
+        // Atomicity gate: Replace/Create/CreateAppend run DDL before the multipart
+        // INSERT, so with nothing bound Replace would drop the table and leave it
+        // empty.  Rejected before any pre-SQL is generated, so DDL never runs
+        // without DML.
+        if (is_ingest && !has_data)
+            return SetError(
+                error, ADBC_STATUS_INVALID_STATE, "Ingest target set but no data bound; call Bind/BindStream before ExecuteQuery");
+
         // Bulk ingest: synthesise CREATE / DROP / INSERT statements based on the
         // configured mode and the deep-copied bound schema.  Regenerated on every
         // call to support statement reuse.  Each pre-SQL entry is sent as a
         // separate HTTP request — Firebolt rejects multiple statements in one body.
-        const bool is_ingest = fs->ingest && !fs->ingest->target_table.empty();
-
-        // Atomicity gate: pre-SQL for Replace/Create/CreateAppend modes runs
-        // DDL (DROP / CREATE) before the multipart INSERT.  If no Arrow IPC
-        // payload was bound, the INSERT cannot land — Replace would have
-        // dropped the existing table and left it empty.  Reject the request
-        // BEFORE generating any pre-SQL so DDL never runs without DML.
-        if (is_ingest && fs->ingest->ipc_bytes.empty())
-            return SetError(
-                error,
-                ADBC_STATUS_INVALID_STATE,
-                "Ingest target set but no data bound; call Bind/BindStream before ExecuteQuery");
-
-        // Data bound with no ingest target.  Firebolt's HTTP interface has no
-        // query-parameter binding, and the multipart branch below keys on
-        // ipc_bytes alone — so this would otherwise POST the caller's SQL with a
-        // stray data.arrow part and fail server-side with an opaque upload
-        // error.  This is the shape `cursor.execute(sql, parameters)` produces.
-        if (!is_ingest && fs->ingest && !fs->ingest->ipc_bytes.empty())
-            return SetError(
-                error,
-                ADBC_STATUS_NOT_IMPLEMENTED,
-                "Query parameter binding is not supported. Bind/BindStream is only valid for bulk ingest, with the "
-                "ingest target-table option set; inline literals into the SQL instead.");
-
+        // The generated INSERT goes into a local, leaving the statement's own SQL
+        // text untouched so it stays re-executable.
+        std::string sql = fs->sql;
         std::vector<std::string> pre_sql;
+        std::vector<uint8_t> ipc_bytes;
         if (is_ingest)
         {
-            AdbcStatusCode rc = buildIngestSql(fs, pre_sql, fs->sql, error);
+            AdbcStatusCode rc = buildIngestSql(fs, pre_sql, sql, error);
+            if (rc != ADBC_STATUS_OK)
+                return rc;
+
+            // The upload is the only consumer of Arrow IPC.  Encoded before any
+            // pre-SQL runs, for the reason the gate above exists: an encoding failure
+            // must not leave a Replace having dropped the target.
+            rc = SerializeBoundData(*fs->bound, ipc_bytes, error);
             if (rc != ADBC_STATUS_OK)
                 return rc;
         }
@@ -771,19 +1045,42 @@ static AdbcStatusCode StatementExecuteQuery(AdbcStatement * stmt, ArrowArrayStre
         }
 
         HttpResponse resp;
-        // Use the multipart-insert path only when Bind/BindStream actually
-        // produced IPC bytes.
-        if (fs->ingest && !fs->ingest->ipc_bytes.empty())
-            resp = conn->http->executeInsert(fs->sql, fs->ingest->ipc_bytes, conn->session_params);
+        if (is_ingest)
+        {
+            resp = conn->http->executeInsert(sql, ipc_bytes, conn->session_params);
+            ApplySessionUpdates(conn, resp);
+            if (!resp.isSuccess())
+                return HttpRespToStatus(resp, error);
+        }
+        else if (!param_sets.empty())
+        {
+            // One request per parameter set — "the query is executed once per row of
+            // the bound data", for ExecuteQuery as much as ExecuteUpdate.  A failure
+            // stops the run; earlier executions stay applied, which is what a
+            // transaction is for.  A requested result set is the last execution's,
+            // there being one ArrowArrayStream to hand back.
+            for (const auto & param_set : param_sets)
+            {
+                // A per-request copy: a caller's own `query_parameters` session
+                // parameter is overridden for this request, not mutated.
+                std::unordered_map<std::string, std::string> params = conn->session_params;
+                params[QUERY_PARAMETERS_SETTING] = param_set;
+
+                resp = conn->http->executeQuery(sql, params);
+                ApplySessionUpdates(conn, resp);
+                if (!resp.isSuccess())
+                    return HttpRespToStatus(resp, error);
+            }
+        }
         else
-            resp = conn->http->executeQuery(fs->sql, conn->session_params);
+        {
+            resp = conn->http->executeQuery(sql, conn->session_params);
+            ApplySessionUpdates(conn, resp);
+            if (!resp.isSuccess())
+                return HttpRespToStatus(resp, error);
+        }
 
-        ApplySessionUpdates(conn, resp);
-
-        if (!resp.isSuccess())
-            return HttpRespToStatus(resp, error);
-
-        // Ingest state is cleared by FIREBOLT_SCOPE_GUARD at function exit.
+        // Bound state is cleared by FIREBOLT_SCOPE_GUARD at function exit.
 
         if (out)
         {

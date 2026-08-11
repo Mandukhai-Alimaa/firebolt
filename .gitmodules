@@ -13,3 +13,6 @@
 [submodule "submodule/boringssl"]
 	path = submodule/boringssl
 	url = https://github.com/google/boringssl.git
+[submodule "submodule/json"]
+	path = submodule/json
+	url = https://github.com/nlohmann/json.git

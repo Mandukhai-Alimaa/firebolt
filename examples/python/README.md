@@ -52,14 +52,16 @@ python examples/python/quickstart.py
 | [`quickstart.py`](quickstart.py) | Connect and query, through both the DBAPI wrapper and the low-level ADBC objects. Start here. |
 | [`query_to_pandas.py`](query_to_pandas.py) | Results as `pyarrow.Table`, `pandas.DataFrame`, and `polars.DataFrame`; plus streaming a 100k-row result in batches instead of materialising it. |
 | [`bulk_ingest.py`](bulk_ingest.py) | Uploading Arrow data: all four ingest modes, nested `ARRAY`/`STRUCT` columns with driver-generated DDL, and the low-level `bind_stream` path. |
+| [`query_params.py`](query_params.py) | Binding values into a query: positional `$1`, `$2`, …, named `param('name')`, `executemany`, and the parameter schema from `adbc_prepare`. |
 
-`bulk_ingest.py` creates and drops tables named `adbc_example_*`.
+`bulk_ingest.py` and `query_params.py` create and drop tables named
+`adbc_example_*`.
 
 ## Things worth knowing
 
-- **No parameterized queries.** `cursor.execute(sql, params)` raises
-  `NotSupportedError` — Firebolt's HTTP interface has no parameter binding.
-  Inline literals into the SQL.
+- **Placeholders are `$1`, `$2`, …**, not `?` or `%s` — see
+  [`query_params.py`](query_params.py). Values are substituted by the server into
+  the parsed statement, so never format them into the SQL yourself.
 - **`cursor.rowcount` is always `-1`.** The server does not report affected rows
   over this interface. Use `SELECT count(*)` when you need a number.
 - **Pass `autocommit=True`** when a write has to be visible to a later read on a

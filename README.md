@@ -152,6 +152,43 @@ with dbapi.connect(driver=DRIVER, db_kwargs={"uri": URI}, autocommit=False) as c
 
 Pass `autocommit=True` for each statement to stand on its own.
 
+### Query parameters
+
+Placeholders are positional: `$1`, `$2`, … — Firebolt's own syntax, not `?` or `%s`.
+Values are never spliced into your SQL; they travel beside it and the server
+substitutes them into the parsed statement, so a value containing quotes or SQL
+keywords is data.
+
+```python
+cur.execute("SELECT $1 + 1", (41,))                     # → 42
+cur.execute("SELECT id FROM events WHERE label = $1", ("a'; DROP TABLE events; --",))
+cur.executemany("INSERT INTO events VALUES ($1, $2)", [(1, "a"), (2, "b")])
+```
+
+Each parameter keeps its type: integers as `BIGINT`, floats as `DOUBLE`, booleans as
+`BOOLEAN`, `None` as an untyped `NULL`. Dates, timestamps and decimals travel as text
+and coerce at the use site — cast (`$1::DATE`) where the context does not imply one.
+`bytes` and nested values cannot be bound <sup>[4](#fn4)</sup>.
+
+Named parameters are read through Firebolt's `param()` function, and are always
+`TEXT`. Pass a dict to name them:
+
+```python
+cur.execute("SELECT param('who')", {"who": "ann"})
+cur.execute("SELECT param('cutoff')::INT + 1", {"cutoff": 41})
+```
+
+Use one style per statement. A dict also binds `$1`, `$2`, … — to its keys in
+insertion order — so a statement mixing the two changes meaning when the dict literal
+is reordered <sup>[17](#fn17)</sup>.
+
+`cur.adbc_prepare(sql)` returns the parameter schema the server infers, without
+running the statement:
+
+```python
+cur.adbc_prepare("SELECT label FROM events WHERE id = $1")   # → schema: $1: int32
+```
+
 ### Metadata
 
 ```python
@@ -179,9 +216,9 @@ conn.adbc_get_objects(depth="columns")            # catalogs → schemas → tab
 | Catalog (GetObjects): depth=db_schemas | ✅ |
 | Catalog (GetObjects): depth=tables | ✅ |
 | Catalog (GetObjects): depth=columns (all) | ✅ |
-| Get Parameter Schema | ❌ <sup>[4](#fn4)</sup> |
+| Get Parameter Schema | ✅ <sup>[5](#fn5)</sup> |
 | Get Table Schema | ✅ |
-| Prepared Statements | ⚠️ <sup>[5](#fn5)</sup> |
+| Prepared Statements | ✅ <sup>[5](#fn5)</sup> |
 | Transactions | ✅ |
 
 ### Beyond the standard table
@@ -193,7 +230,8 @@ Driver-level capabilities the shared table does not cover.
 | Result streaming as Arrow record batches | ✅ |
 | Session parameter passthrough, server-driven session updates | ✅ |
 | Per-connection bearer token | ✅ |
-| Query parameter binding (`execute(sql, params)`) | ❌ <sup>[4](#fn4)</sup> |
+| Query parameter binding (`execute(sql, params)`) | ✅ `$1`, `$2`, … <sup>[4](#fn4)</sup> |
+| Named parameter binding (`execute(sql, {...})`) | ✅ via `param('name')` <sup>[17](#fn17)</sup> |
 | `rowcount` on DML | ❌ always `-1` <sup>[6](#fn6)</sup> |
 | TLS / `https://` endpoints | ❌ not in this build |
 | Discovery-based authentication | ❌ see [docs/authentication.md](docs/authentication.md) |
@@ -231,33 +269,38 @@ Nesting is preserved to any depth: `ARRAY(ARRAY(INT))` reads as
 
 #### Arrow to Database
 
-Applies to **bulk ingest**, where the driver generates `CREATE TABLE` DDL from the
-bound Arrow schema. There is no Bind column because Firebolt's HTTP interface has
-no query parameter binding <sup>[4](#fn4)</sup>.
+Two paths, with different limits. **Ingest** generates `CREATE TABLE` DDL from the
+bound Arrow schema and uploads the data as Arrow IPC. **Bind** sends the value as a
+query parameter, a format carrying only `NULL`, booleans, numbers and strings — so
+anything else is rendered as text and cast, or cannot be sent.
 
-| Arrow Type | Firebolt Type | Ingest |
-|---|---|---|
-| `bool` | `BOOLEAN` | ✅ |
-| `int8`, `int16`, `int32`, `uint8`, `uint16` | `INTEGER` | ✅ |
-| `int64`, `uint32` | `BIGINT` | ✅ |
-| `uint64` | `BIGINT` | ⚠️ <sup>[9](#fn9)</sup> |
-| `float` | `REAL` | ✅ |
-| `double` | `DOUBLE PRECISION` | ✅ |
-| `string`, `large_string` | `TEXT` | ✅ |
-| `string_view` | `TEXT` | ❌ <sup>[10](#fn10)</sup> |
-| `binary`, `large_binary`, `fixed_size_binary` | `BYTEA` | ✅ |
-| `binary_view` | `BYTEA` | ❌ <sup>[10](#fn10)</sup> |
-| `date32[day]`, `date64[ms]` | `DATE` | ✅ |
-| `timestamp[s\|ms\|us\|ns]` | `TIMESTAMP` | ✅ |
-| `timestamp` (with time zone) | `TIMESTAMPTZ` | ✅ <sup>[11](#fn11)</sup> |
-| `decimal128(p, s)` | `NUMERIC(p, s)` | ✅ <sup>[12](#fn12)</sup> |
-| `decimal32`, `decimal64`, `decimal256` | `NUMERIC(p, s)` | ❌ <sup>[13](#fn13)</sup> |
-| `list<T>`, `large_list<T>` | `ARRAY(T)` | ✅ |
-| `fixed_size_list<T>` | `ARRAY(T)` | ❌ <sup>[14](#fn14)</sup> |
-| `struct<…>` | `STRUCT(…)` | ✅ <sup>[3](#fn3)</sup> |
-| `dictionary` | (no mapping) | ❌ <sup>[15](#fn15)</sup> |
-| `map` | (no mapping) | ❌ <sup>[16](#fn16)</sup> |
-| `null`, `duration`, `interval`, `time32`, `time64` | (no mapping) | ❌ <sup>[16](#fn16)</sup> |
+| Arrow Type | Firebolt Type | Ingest | Bind |
+|---|---|---|---|
+| `bool` | `BOOLEAN` | ✅ | ✅ |
+| `int8`, `int16`, `int32`, `uint8`, `uint16` | `INTEGER` | ✅ | ✅ as `BIGINT` |
+| `int64`, `uint32` | `BIGINT` | ✅ | ✅ |
+| `uint64` | `BIGINT` | ⚠️ <sup>[9](#fn9)</sup> | ⚠️ <sup>[9](#fn9)</sup> |
+| `float` | `REAL` | ✅ | ✅ as `DOUBLE` |
+| `double` | `DOUBLE PRECISION` | ✅ | ✅ <sup>[18](#fn18)</sup> |
+| `string`, `large_string` | `TEXT` | ✅ | ✅ |
+| `string_view` | `TEXT` | ❌ <sup>[10](#fn10)</sup> | ✅ |
+| `binary`, `large_binary`, `fixed_size_binary` | `BYTEA` | ✅ | ❌ <sup>[4](#fn4)</sup> |
+| `binary_view` | `BYTEA` | ❌ <sup>[10](#fn10)</sup> | ❌ <sup>[4](#fn4)</sup> |
+| `date32[day]`, `date64[ms]` | `DATE` | ✅ | ✅ as text <sup>[19](#fn19)</sup> |
+| `timestamp[s\|ms\|us\|ns]` | `TIMESTAMP` | ✅ | ✅ as text <sup>[19](#fn19)</sup> |
+| `timestamp` (with time zone) | `TIMESTAMPTZ` | ✅ <sup>[11](#fn11)</sup> | ✅ as text <sup>[19](#fn19)</sup> |
+| `time32`, `time64` | (no mapping) | ❌ <sup>[16](#fn16)</sup> | ✅ as text <sup>[19](#fn19)</sup> |
+| `decimal128(p, s)` | `NUMERIC(p, s)` | ✅ <sup>[12](#fn12)</sup> | ✅ as text <sup>[19](#fn19)</sup> |
+| `decimal32`, `decimal64`, `decimal256` | `NUMERIC(p, s)` | ❌ <sup>[13](#fn13)</sup> | ✅ as text <sup>[19](#fn19)</sup> |
+| `list<T>`, `large_list<T>` | `ARRAY(T)` | ✅ | ❌ <sup>[4](#fn4)</sup> |
+| `fixed_size_list<T>` | `ARRAY(T)` | ❌ <sup>[14](#fn14)</sup> | ❌ <sup>[4](#fn4)</sup> |
+| `struct<…>` | `STRUCT(…)` | ✅ <sup>[3](#fn3)</sup> | ❌ <sup>[4](#fn4)</sup> |
+| `dictionary` | (no mapping) | ❌ <sup>[15](#fn15)</sup> | ❌ <sup>[4](#fn4)</sup> |
+| `map` | (no mapping) | ❌ <sup>[16](#fn16)</sup> | ❌ <sup>[4](#fn4)</sup> |
+| `null`, `duration`, `interval` | (no mapping) | ❌ <sup>[16](#fn16)</sup> | ❌ <sup>[4](#fn4)</sup> |
+
+A `NULL` in any column binds as an untyped SQL `NULL` whatever the column's Arrow
+type, including the types marked ❌ above.
 
 `ARRAY` and `STRUCT` compose to any depth, so `list<struct<…>>` and
 `struct<…, list<…>>` both generate correct DDL.
@@ -275,12 +318,19 @@ no query parameter binding <sup>[4](#fn4)</sup>.
    `STRUCT(… NOT NULL)` with "STRUCT fields have to be nullable". A zero-field
    struct has no mapping — there is no `STRUCT()` in Firebolt — so ingest fails
    rather than emitting DDL the server would reject.
-4. <a id="fn4"></a>Firebolt's HTTP interface has no parameter binding, so
-   `GetParameterSchema` returns `ADBC_STATUS_NOT_IMPLEMENTED` and
-   `cursor.execute(sql, params)` raises `NotSupportedError`. Inline literals into
-   the SQL.
-5. <a id="fn5"></a>`Prepare` succeeds but is a no-op: there is no server-side
-   prepare. Calling it is harmless and buys nothing.
+4. <a id="fn4"></a>Placeholders are `$1`, `$2`, … — see
+   [Query parameters](#query-parameters). A parameter travels as JSON, a format
+   carrying only `NULL`, booleans, numbers and strings, so binding `binary` or a
+   nested type returns `ADBC_STATUS_NOT_IMPLEMENTED` naming the type. Ingest them
+   instead, or encode them yourself.
+5. <a id="fn5"></a>There is no server-side prepare — a parameterised statement is
+   sent whole every time — so `Prepare` issues no request, and
+   `cursor.execute(sql, params)` costs one HTTP request like any other query.
+   `GetParameterSchema` does the work: the server validates the statement and reports
+   its placeholder types without executing it. Each `adbc_prepare()` costs one
+   request, uncached, since DDL can change the types under an unchanged statement.
+   With autocommit off it cannot see objects created in the open transaction; see
+   [OPTIONS.md](OPTIONS.md#parameter-metadata).
 6. <a id="fn6"></a>The server does not report affected rows over this interface.
    Use `SELECT count(*)` when you need a number.
 7. <a id="fn7"></a>`GetOption*`, `SetOptionInt`/`Double`/`Bytes`, `Cancel`,
@@ -289,12 +339,13 @@ no query parameter binding <sup>[4](#fn4)</sup>.
 8. <a id="fn8"></a>Raw WKB bytes, with no `geoarrow` extension metadata — unlike
    some other drivers, which surface `extension<geoarrow.wkt>`.
 9. <a id="fn9"></a>`BIGINT` is signed, so a value above `int64` max
-   (9223372036854775807) is rejected by the server with "Convert overflow".
-   Values at or below it round-trip exactly.
-10. <a id="fn10"></a>The driver maps the view types to `TEXT`/`BYTEA`, but
-    nanoarrow's IPC writer cannot encode Arrow's view layouts, so the upload fails
-    with an `ADBC_STATUS_INTERNAL` error before reaching the server. Cast to
-    `string`/`binary` first.
+   (9223372036854775807) is rejected — on ingest by the server with "Convert
+   overflow", on bind by the driver with `ADBC_STATUS_INVALID_ARGUMENT`. Values at
+   or below it round-trip exactly.
+10. <a id="fn10"></a>The driver maps the view types to `TEXT`/`BYTEA`, but nanoarrow's
+    IPC writer cannot encode Arrow's view layouts, so the *ingest* upload fails with
+    `ADBC_STATUS_INTERNAL` before reaching the server; cast to `string`/`binary`
+    first. Binding is unaffected — a parameter never travels as Arrow IPC.
 11. <a id="fn11"></a>The instant is preserved and normalised to UTC; the original
     offset is not retained. `12:00+02:00` reads back as `10:00Z`.
 12. <a id="fn12"></a>Precision must be 38 or less, Firebolt's maximum. Above that
@@ -308,6 +359,20 @@ no query parameter binding <sup>[4](#fn4)</sup>.
 16. <a id="fn16"></a>No Firebolt equivalent, so ingest fails with
     `ADBC_STATUS_NOT_IMPLEMENTED` rather than uploading DDL the server would
     reject.
+17. <a id="fn17"></a>Firebolt has no named *placeholder* (`$foo` is an identifier), so
+    a named parameter is read through `param('name')`, which always yields `TEXT`.
+    Cast it (`param('n')::INT`) for anything else. The driver sends the positional
+    `$N` names alongside the aliases so a stale `adbc.statement.bind_by_name` cannot
+    unbind a placeholder — a safety net, not a second addressing scheme: `$N` follows
+    the dict's key order, which the naming API otherwise never asks you to think
+    about.
+18. <a id="fn18"></a>Bound as a JSON number with a fractional part, so `3.0` stays a
+    `DOUBLE` rather than arriving as a `BIGINT`. `NaN` and infinities have no JSON
+    or SQL literal and are rejected with `ADBC_STATUS_INVALID_ARGUMENT`.
+19. <a id="fn19"></a>Sent as a string in canonical text form, the parameter format
+    having no date, time or decimal type. Firebolt coerces it in most contexts;
+    elsewhere cast explicitly (`$1::DATE`, `$1::DECIMAL(38, 9)`). A decimal is never
+    a JSON number, which would round it through a `double`.
 
 ## Options
 
@@ -338,7 +403,13 @@ today's names to the canonical ones is in
 | `IO: curl error: Couldn't connect to server` | Nothing is listening. Check the container is up and the port matches: `curl -fsS http://localhost:3473/ping`. |
 | `Cluster not yet healthy` | The engine answers `/ping` before it can serve queries. Retry `SELECT 1` for a few seconds. |
 | `UNAUTHORIZED: HTTP 401` / `403` | The engine wants authentication. Supply `adbc.firebolt.token`; see [docs/authentication.md](docs/authentication.md). |
-| `NOT_IMPLEMENTED: Query parameter binding is not supported` | `cursor.execute(sql, params)` — inline literals into the SQL instead. |
+| `Query referenced positional parameter $1, but it was not set` | The statement has more `$N` placeholders than you passed values for. Note `$1` is 1-based. |
+| `NOT_IMPLEMENTED: Cannot bind a parameter of Arrow type binary` | `bytes`, lists and structs cannot be query parameters <sup>[4](#fn4)</sup>. Ingest them, or encode them to text yourself. |
+| `INVALID_ARGUMENT: Parameter value … exceeds the BIGINT range` | A `uint64` above `int64` max; Firebolt parameters are signed. |
+| `INVALID_ARGUMENT: Parameter value is not finite` | `NaN` or an infinity was bound. Neither has a JSON or SQL literal. |
+| `INVALID_ARGUMENT: Parameter value … is not a valid time of day` | A negative `time32`/`time64` value. |
+| `execute()` with several parameter sets returns only one result set | Expected: the statement runs once per bound row, and the returned result is the last execution's. Use `executemany()` when you do not want a result. |
+| A parameter compares as text against a typed column | Add an explicit cast: `$1::DATE`, `param('n')::INT` <sup>[19](#fn19)</sup>. |
 | `NOT_FOUND: Unknown Firebolt database option '…'` | A misspelled `adbc.firebolt.*` key. Compare against [OPTIONS.md](OPTIONS.md). |
 | `NOT_IMPLEMENTED: Temporary ingest tables are not supported` | `adbc_ingest(..., temporary=True)`. Firebolt has no session-temporary tables. |
 | `NOT_IMPLEMENTED: ingest column type cannot be mapped …` | The Arrow schema has a type with no Firebolt equivalent. Cast it before ingesting. |

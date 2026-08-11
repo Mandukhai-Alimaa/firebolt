@@ -9,10 +9,7 @@ template <typename Fn>
 class ScopeGuard
 {
 public:
-    explicit ScopeGuard(Fn && fn)
-        : fn_(std::move(fn))
-    {
-    }
+    explicit ScopeGuard(Fn && fn) : fn_(std::move(fn)) { }
 
     ScopeGuard(const ScopeGuard &) = delete;
     ScopeGuard & operator=(const ScopeGuard &) = delete;

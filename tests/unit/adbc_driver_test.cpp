@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include "ArrowIpcStream.h"
+#include "DescribeParameters.h"
 #include "FireboltAdbcConnection.h"
 #include "FireboltAdbcStatement.h"
 #include "IngestSqlBuilder.h"
+#include "QueryParameters.h"
 #include "adbc.h"
 
 #include <nanoarrow/nanoarrow.hpp>
@@ -12,7 +14,9 @@
 #include <curl/curl.h>
 
 #include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Entry points defined in FireboltAdbcDriver.cpp
@@ -70,6 +74,48 @@ nanoarrow::UniqueSchema MakeStructSchemaWithColumn(ArrowType column_type, const 
     if (!nullable)
         schema->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
     return schema;
+}
+
+// Build a one-column batch from integral values — usable for every type whose
+// storage is an integer, which is most of them (ints, bool, date, time, timestamp).
+nanoarrow::UniqueArray MakeOneColumnBatch(const ArrowSchema * schema, const std::vector<int64_t> & values)
+{
+    nanoarrow::UniqueArray batch;
+    EXPECT_EQ(ArrowArrayInitFromSchema(batch.get(), schema, nullptr), 0);
+    EXPECT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    for (int64_t value : values)
+    {
+        EXPECT_EQ(ArrowArrayAppendInt(batch->children[0], value), 0);
+        EXPECT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    }
+    EXPECT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+    return batch;
+}
+
+// Render one row of a batch as the `query_parameters` setting value, the way the
+// driver does before a parameterised execution.
+AdbcStatusCode RenderParameterSet(
+    const ArrowSchema * schema, const ArrowArray * batch, int64_t row, bool bind_by_name, std::string & out_json, std::string & out_error)
+{
+    ArrowArrayView view{};
+    memset(&view, 0, sizeof(view));
+    ArrowError arrow_error{};
+    EXPECT_EQ(ArrowArrayViewInitFromSchema(&view, schema, &arrow_error), 0) << arrow_error.message;
+    EXPECT_EQ(ArrowArrayViewSetArray(&view, batch, &arrow_error), 0) << arrow_error.message;
+    AdbcStatusCode rc = firebolt::adbc::buildQueryParametersJson(schema, &view, row, bind_by_name, out_json, out_error);
+    ArrowArrayViewReset(&view);
+    return rc;
+}
+
+// The common shape: one column of one integral value, rendered positionally.
+std::string RenderOneIntegral(ArrowType column_type, int64_t value)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(column_type, "0");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {value});
+    std::string json;
+    std::string error;
+    EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    return json;
 }
 
 } // namespace
@@ -438,10 +484,8 @@ TEST(ConnectionTest, PerConnectionTokensAreIndependent)
     ASSERT_NE(fc_a, nullptr);
     ASSERT_NE(fc_b, nullptr);
     EXPECT_EQ(fc_a->token, "tokenA");
-    EXPECT_EQ(fc_b->token, "tokenB")
-        << "second connection's token did not land on its own FireboltConnection";
-    EXPECT_NE(fc_a->token, fc_b->token)
-        << "tokens collided — connections share a token store";
+    EXPECT_EQ(fc_b->token, "tokenB") << "second connection's token did not land on its own FireboltConnection";
+    EXPECT_NE(fc_a->token, fc_b->token) << "tokens collided — connections share a token store";
 
     driver.ConnectionRelease(&conn_a, nullptr);
     driver.ConnectionRelease(&conn_b, nullptr);
@@ -471,8 +515,7 @@ TEST(ConnectionTest, SecondConnectionDoesNotOverrideFirst)
     ASSERT_EQ(fc_a->token, "tokenA");
 
     ASSERT_EQ(driver.ConnectionSetOption(&conn_b, "adbc.firebolt.token", "tokenB", &error), ADBC_STATUS_OK);
-    EXPECT_EQ(fc_a->token, "tokenA")
-        << "connection A's token was clobbered when connection B set its token";
+    EXPECT_EQ(fc_a->token, "tokenA") << "connection A's token was clobbered when connection B set its token";
 
     driver.ConnectionRelease(&conn_a, nullptr);
     driver.ConnectionRelease(&conn_b, nullptr);
@@ -502,8 +545,7 @@ TEST(ConnectionTest, TokenSetBeforeInitIsPreserved)
 
     auto * fc = static_cast<firebolt::adbc::FireboltConnection *>(conn.private_data);
     ASSERT_NE(fc, nullptr);
-    EXPECT_EQ(fc->token, "preInitToken")
-        << "pre-Init ConnectionSetOption('adbc.firebolt.token') was clobbered by fdb->token in Init";
+    EXPECT_EQ(fc->token, "preInitToken") << "pre-Init ConnectionSetOption('adbc.firebolt.token') was clobbered by fdb->token in Init";
 
     driver.ConnectionRelease(&conn, nullptr);
     driver.DatabaseRelease(&db, nullptr);
@@ -529,8 +571,7 @@ TEST(ConnectionTest, TokenNotStoredInSessionParams)
 
     auto * fc = static_cast<firebolt::adbc::FireboltConnection *>(conn.private_data);
     ASSERT_NE(fc, nullptr);
-    EXPECT_EQ(fc->session_params.count("adbc.firebolt.token"), 0u)
-        << "token leaked into session_params; will be appended to query URL";
+    EXPECT_EQ(fc->session_params.count("adbc.firebolt.token"), 0u) << "token leaked into session_params; will be appended to query URL";
 
     driver.ConnectionRelease(&conn, nullptr);
     driver.DatabaseRelease(&db, nullptr);
@@ -709,9 +750,7 @@ TEST(IngestSqlBuilderTest, QualifiedTableSchemaPrefixed)
 
 TEST(IngestSqlBuilderTest, QualifiedTableFullyQualified)
 {
-    EXPECT_EQ(
-        firebolt::adbc::qualifiedTable("warehouse", "public", "events"),
-        "\"warehouse\".\"public\".\"events\"");
+    EXPECT_EQ(firebolt::adbc::qualifiedTable("warehouse", "public", "events"), "\"warehouse\".\"public\".\"events\"");
 }
 
 // ============================================================
@@ -721,32 +760,24 @@ TEST(IngestSqlBuilderTest, QualifiedTableFullyQualified)
 
 TEST(GetTableSchemaSqlTest, NoSchemaProducesSinglePart)
 {
-    EXPECT_EQ(
-        firebolt::adbc::buildTableSchemaSql("", "users"),
-        "SELECT * FROM \"users\" LIMIT 0");
+    EXPECT_EQ(firebolt::adbc::buildTableSchemaSql("", "users"), "SELECT * FROM \"users\" LIMIT 0");
 }
 
 TEST(GetTableSchemaSqlTest, WithSchemaProducesTwoPart)
 {
-    EXPECT_EQ(
-        firebolt::adbc::buildTableSchemaSql("public", "users"),
-        "SELECT * FROM \"public\".\"users\" LIMIT 0");
+    EXPECT_EQ(firebolt::adbc::buildTableSchemaSql("public", "users"), "SELECT * FROM \"public\".\"users\" LIMIT 0");
 }
 
 TEST(GetTableSchemaSqlTest, QuotesEmbeddedDoubleQuoteInTable)
 {
     // Adversarial table name that would otherwise close the identifier and
     // inject SQL.  Embedded `"` must be doubled.
-    EXPECT_EQ(
-        firebolt::adbc::buildTableSchemaSql("", "users\"x"),
-        "SELECT * FROM \"users\"\"x\" LIMIT 0");
+    EXPECT_EQ(firebolt::adbc::buildTableSchemaSql("", "users\"x"), "SELECT * FROM \"users\"\"x\" LIMIT 0");
 }
 
 TEST(GetTableSchemaSqlTest, QuotesEmbeddedDoubleQuoteInSchema)
 {
-    EXPECT_EQ(
-        firebolt::adbc::buildTableSchemaSql("pu\"blic", "users"),
-        "SELECT * FROM \"pu\"\"blic\".\"users\" LIMIT 0");
+    EXPECT_EQ(firebolt::adbc::buildTableSchemaSql("pu\"blic", "users"), "SELECT * FROM \"pu\"\"blic\".\"users\" LIMIT 0");
 }
 
 TEST(GetTableSchemaSqlTest, RejectsSqlInjectionAttempt)
@@ -761,8 +792,7 @@ TEST(GetTableSchemaSqlTest, RejectsSqlInjectionAttempt)
     // Sanity: no semicolon outside the quoted identifier.
     auto last_quote = sql.find_last_of('"');
     auto trailing = sql.substr(last_quote);
-    EXPECT_EQ(trailing.find(';'), std::string::npos)
-        << "trailing=" << trailing;
+    EXPECT_EQ(trailing.find(';'), std::string::npos) << "trailing=" << trailing;
 }
 
 // ============================================================
@@ -889,9 +919,7 @@ TEST(ArrowToFireboltTypeTest, NestedStructMapsToNestedFireboltStruct)
     ASSERT_EQ(ArrowSchemaSetType(outer->children[1]->children[1], NANOARROW_TYPE_STRING), 0);
     ASSERT_EQ(ArrowSchemaSetName(outer->children[1]->children[1], "z"), 0);
 
-    EXPECT_EQ(
-        firebolt::adbc::arrowTypeToFireboltSqlType(outer),
-        "STRUCT(\"x\" INT, \"child\" STRUCT(\"y\" BIGINT, \"z\" TEXT))");
+    EXPECT_EQ(firebolt::adbc::arrowTypeToFireboltSqlType(outer), "STRUCT(\"x\" INT, \"child\" STRUCT(\"y\" BIGINT, \"z\" TEXT))");
 }
 
 TEST(ArrowToFireboltTypeTest, ListOfStructMapsToArrayOfStruct)
@@ -1023,9 +1051,7 @@ TEST(BuildCreateTableColumnsTest, MultipleColumns)
     ASSERT_EQ(ArrowSchemaSetType(schema->children[2], NANOARROW_TYPE_DOUBLE), 0);
     ASSERT_EQ(ArrowSchemaSetName(schema->children[2], "value"), 0);
 
-    EXPECT_EQ(
-        firebolt::adbc::buildCreateTableColumns(schema.get()),
-        "\"id\" INT NOT NULL, \"label\" TEXT, \"value\" DOUBLE PRECISION");
+    EXPECT_EQ(firebolt::adbc::buildCreateTableColumns(schema.get()), "\"id\" INT NOT NULL, \"label\" TEXT, \"value\" DOUBLE PRECISION");
 }
 
 TEST(BuildCreateTableColumnsTest, NotNullStructColumnKeepsColumnLevelNotNull)
@@ -1126,9 +1152,38 @@ TEST(StatementSetOptionTest, KnownIngestModesAccepted)
              ADBC_INGEST_OPTION_MODE_CREATE_APPEND,
          })
     {
-        EXPECT_EQ(f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_MODE, mode, &error), ADBC_STATUS_OK)
-            << "mode=" << mode;
+        EXPECT_EQ(f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_MODE, mode, &error), ADBC_STATUS_OK) << "mode=" << mode;
     }
+    if (error.release)
+        error.release(&error);
+}
+
+// ADBC's default ingest mode is create ("Whether to create (the default) or append",
+// adbc.h).  Only the low-level path can observe it — dbapi's Cursor.adbc_ingest()
+// always sends a mode — and an append into a table nobody created is a "table does
+// not exist" error.
+TEST(StatementSetOptionTest, IngestModeDefaultsToCreate)
+{
+    IngestOptionFixture f;
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_TARGET_TABLE, "events", &error), ADBC_STATUS_OK);
+
+    auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(f.stmt.private_data);
+    ASSERT_NE(fs, nullptr);
+    ASSERT_TRUE(fs->bound.has_value());
+    EXPECT_EQ(fs->bound->mode, firebolt::adbc::IngestMode::Create);
+
+    // And the default has to reach the generated SQL, not just the struct.
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT32, "x");
+    fs->bound->schema.reset();
+    ASSERT_EQ(ArrowSchemaDeepCopy(schema.get(), fs->bound->schema.get()), 0);
+
+    std::vector<std::string> pre_sql;
+    std::string insert_sql;
+    ASSERT_EQ(firebolt::adbc::buildIngestSql(fs, pre_sql, insert_sql, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(pre_sql.size(), 1u) << "the default mode generated no CREATE TABLE";
+    EXPECT_EQ(pre_sql[0], "CREATE TABLE \"events\" (\"x\" INT)");
+
     if (error.release)
         error.release(&error);
 }
@@ -1138,8 +1193,7 @@ TEST(StatementSetOptionTest, UnknownIngestModeRejected)
     IngestOptionFixture f;
     AdbcError error = ADBC_ERROR_INIT;
     EXPECT_EQ(
-        f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_MODE, "adbc.ingest.mode.bogus", &error),
-        ADBC_STATUS_INVALID_ARGUMENT);
+        f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_MODE, "adbc.ingest.mode.bogus", &error), ADBC_STATUS_INVALID_ARGUMENT);
     if (error.release)
         error.release(&error);
 }
@@ -1150,9 +1204,7 @@ TEST(StatementSetOptionTest, TemporaryFalseSilentlyAccepted)
     // no-op that dbapi sends by default; it must not cause adbc_ingest() to fail.
     IngestOptionFixture f;
     AdbcError error = ADBC_ERROR_INIT;
-    EXPECT_EQ(
-        f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_TEMPORARY, ADBC_OPTION_VALUE_DISABLED, &error),
-        ADBC_STATUS_OK);
+    EXPECT_EQ(f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_TEMPORARY, ADBC_OPTION_VALUE_DISABLED, &error), ADBC_STATUS_OK);
     if (error.release)
         error.release(&error);
 }
@@ -1163,8 +1215,7 @@ TEST(StatementSetOptionTest, TemporaryTrueRejectedWithNotImplemented)
     IngestOptionFixture f;
     AdbcError error = ADBC_ERROR_INIT;
     EXPECT_EQ(
-        f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_TEMPORARY, ADBC_OPTION_VALUE_ENABLED, &error),
-        ADBC_STATUS_NOT_IMPLEMENTED);
+        f.driver.StatementSetOption(&f.stmt, ADBC_INGEST_OPTION_TEMPORARY, ADBC_OPTION_VALUE_ENABLED, &error), ADBC_STATUS_NOT_IMPLEMENTED);
     if (error.release)
         error.release(&error);
 }
@@ -1178,18 +1229,84 @@ TEST(StatementSetOptionTest, NullKeyRejected)
         error.release(&error);
 }
 
-// Regression for ingest atomicity: when an ingest target is configured in a
-// mode that would otherwise generate DDL (Replace / Create / CreateAppend)
-// but no Arrow IPC payload has been bound, ExecuteQuery must fail BEFORE
-// running any pre-SQL — otherwise mode=Replace would silently DROP the
-// existing table even though no INSERT could ever land.
-//
-// We exercise this by manually populating ingest->schema (simulating a
-// BindStream call where schema capture succeeded but serialization failed)
-// while leaving ipc_bytes empty.  The driver is pointed at 127.0.0.1:1, an
-// unreachable port — without the fix, ExecuteQuery would attempt the DROP
-// pre-SQL and return ADBC_STATUS_IO; with the fix it short-circuits on
-// ADBC_STATUS_INVALID_STATE before any HTTP attempt.
+// Misreading the value would silently send the wrong parameter names, so only the
+// two canonical spellings are accepted — the rule the autocommit option follows.
+TEST(StatementSetOptionTest, BindByNameAcceptsOnlyCanonicalValues)
+{
+    IngestOptionFixture f;
+    AdbcError error = ADBC_ERROR_INIT;
+    auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(f.stmt.private_data);
+    ASSERT_NE(fs, nullptr);
+
+    ASSERT_EQ(f.driver.StatementSetOption(&f.stmt, "adbc.statement.bind_by_name", ADBC_OPTION_VALUE_ENABLED, &error), ADBC_STATUS_OK);
+    EXPECT_TRUE(fs->bind_by_name);
+
+    ASSERT_EQ(f.driver.StatementSetOption(&f.stmt, "adbc.statement.bind_by_name", ADBC_OPTION_VALUE_DISABLED, &error), ADBC_STATUS_OK);
+    EXPECT_FALSE(fs->bind_by_name);
+
+    const std::vector<const char *> bad_values = {"TRUE", "1", "yes", ""};
+    for (const char * value : bad_values)
+    {
+        EXPECT_EQ(f.driver.StatementSetOption(&f.stmt, "adbc.statement.bind_by_name", value, &error), ADBC_STATUS_INVALID_ARGUMENT)
+            << "value: " << value;
+        if (error.release)
+            error.release(&error);
+    }
+    EXPECT_FALSE(fs->bind_by_name) << "a rejected value must not change the setting";
+
+    if (error.release)
+        error.release(&error);
+}
+
+// A statement option, so it must outlive the payload it applies to and survive a new
+// query.  A driver manager re-sends it only when its own idea of the setting changes
+// (dbapi tracks it per cursor), so resetting it here would silently revert to
+// positional naming and leave the server reporting parameters "not set in the query".
+TEST(StatementSetOptionTest, BindByNameSurvivesExecuteAndSetSqlQuery)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetOption(&stmt, "adbc.statement.bind_by_name", ADBC_OPTION_VALUE_ENABLED, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT param('who')", &error), ADBC_STATUS_OK);
+
+    auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
+    ASSERT_NE(fs, nullptr);
+    EXPECT_TRUE(fs->bind_by_name) << "SetSqlQuery cleared a statement option";
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "who");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {1});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+    // Unreachable endpoint: the execution fails at the HTTP layer, having consumed
+    // the bound payload on the way out.
+    EXPECT_EQ(driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error), ADBC_STATUS_IO);
+    if (error.release)
+        error.release(&error);
+    EXPECT_FALSE(fs->bound.has_value());
+    EXPECT_TRUE(fs->bind_by_name) << "the option died with the payload it applied to";
+
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+// Ingest atomicity: in a mode that generates DDL (Replace / Create / CreateAppend)
+// with nothing bound, ExecuteQuery must fail before any pre-SQL runs — Replace would
+// otherwise DROP the table with no INSERT able to land.  The state below is a
+// BindStream whose schema capture succeeded and whose bind did not.  Against the
+// unreachable 127.0.0.1:1, a DROP attempt would show as IO instead of INVALID_STATE.
 TEST(StatementExecuteTest, IngestReplaceWithoutBoundDataRejectedBeforeAnyHttp)
 {
     AdbcDriver driver = InitDriver();
@@ -1206,27 +1323,20 @@ TEST(StatementExecuteTest, IngestReplaceWithoutBoundDataRejectedBeforeAnyHttp)
     AdbcStatement stmt{};
     ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
     ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_TARGET_TABLE, "foo", &error), ADBC_STATUS_OK);
-    ASSERT_EQ(
-        driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_REPLACE, &error),
-        ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_REPLACE, &error), ADBC_STATUS_OK);
 
     auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
     ASSERT_NE(fs, nullptr);
-    ASSERT_TRUE(fs->ingest.has_value());
+    ASSERT_TRUE(fs->bound.has_value());
 
-    // Synthesize the post-bind state: schema captured, ipc_bytes empty.
-    nanoarrow::UniqueSchema bound_schema;
-    ArrowSchemaInit(bound_schema.get());
-    ASSERT_EQ(ArrowSchemaSetTypeStruct(bound_schema.get(), 1), 0);
-    ASSERT_EQ(ArrowSchemaSetType(bound_schema->children[0], NANOARROW_TYPE_INT32), 0);
-    ASSERT_EQ(ArrowSchemaSetName(bound_schema->children[0], "x"), 0);
-    fs->ingest->schema.reset();
-    ASSERT_EQ(ArrowSchemaDeepCopy(bound_schema.get(), fs->ingest->schema.get()), 0);
-    ASSERT_TRUE(fs->ingest->ipc_bytes.empty());
+    // Synthesize the post-bind state: schema captured, no data bound.
+    nanoarrow::UniqueSchema bound_schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT32, "x");
+    fs->bound->schema.reset();
+    ASSERT_EQ(ArrowSchemaDeepCopy(bound_schema.get(), fs->bound->schema.get()), 0);
+    ASSERT_FALSE(fs->bound->data_bound);
 
     AdbcStatusCode rc = driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error);
-    EXPECT_EQ(rc, ADBC_STATUS_INVALID_STATE)
-        << "ingest with no bound data must short-circuit before any HTTP / pre-SQL";
+    EXPECT_EQ(rc, ADBC_STATUS_INVALID_STATE) << "ingest with no bound data must short-circuit before any HTTP / pre-SQL";
 
     if (error.release)
         error.release(&error);
@@ -1235,11 +1345,8 @@ TEST(StatementExecuteTest, IngestReplaceWithoutBoundDataRejectedBeforeAnyHttp)
     driver.DatabaseRelease(&db, nullptr);
 }
 
-// Regression for ingest-state lifecycle: changing the statement's SQL must
-// invalidate any previously bound Arrow payload, so that the bytes do not
-// silently re-attach to a query for which they were not intended.  Before
-// the fix the multipart-insert branch keyed on `target_table` + `ipc_bytes`,
-// so a bind from a prior ingest could ride along on a subsequent SELECT.
+// Changing the statement's SQL invalidates any bound payload, so data from a prior
+// ingest cannot ride along on a subsequent SELECT.
 TEST(StatementReuseTest, IngestStateClearedOnSetSqlQuery)
 {
     AdbcDriver driver = InitDriver();
@@ -1252,15 +1359,18 @@ TEST(StatementReuseTest, IngestStateClearedOnSetSqlQuery)
     ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
     ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_TARGET_TABLE, "foo", &error), ADBC_STATUS_OK);
 
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "x");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {41});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+
     auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
     ASSERT_NE(fs, nullptr);
-    ASSERT_TRUE(fs->ingest.has_value());
-    fs->ingest->ipc_bytes = {0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_TRUE(fs->bound.has_value());
+    ASSERT_TRUE(fs->bound->data_bound);
 
     ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT 1", &error), ADBC_STATUS_OK);
 
-    EXPECT_FALSE(fs->ingest.has_value())
-        << "stale bind data persisted across SetSqlQuery; would attach to next query";
+    EXPECT_FALSE(fs->bound.has_value()) << "stale bind data persisted across SetSqlQuery; would attach to next query";
 
     driver.StatementRelease(&stmt, nullptr);
     driver.ConnectionRelease(&conn, nullptr);
@@ -1269,8 +1379,7 @@ TEST(StatementReuseTest, IngestStateClearedOnSetSqlQuery)
         error.release(&error);
 }
 
-// Regression for the same lifecycle bug on the failure path: a failed
-// ExecuteQuery must not leave the bound payload in place.
+// The same on the failure path: a failed ExecuteQuery leaves no bound payload.
 TEST(StatementReuseTest, IngestStateClearedOnFailedExecute)
 {
     AdbcDriver driver = InitDriver();
@@ -1288,24 +1397,22 @@ TEST(StatementReuseTest, IngestStateClearedOnFailedExecute)
     AdbcStatement stmt{};
     ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
     ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_TARGET_TABLE, "foo", &error), ADBC_STATUS_OK);
-    // Append mode: buildIngestSql does not require a schema, so the new
-    // commit-6 ipc_bytes-empty gate is the only thing standing between us
-    // and the HTTP attempt.  Populate ipc_bytes with arbitrary bytes (the
-    // remote will reject them, but only after the request leaves the box).
-    ASSERT_EQ(
-        driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_APPEND, &error),
-        ADBC_STATUS_OK);
+    // Append mode: no DDL pre-SQL, so nothing but the bound-data gate stands between
+    // this and the HTTP attempt the unreachable port rejects.
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_APPEND, &error), ADBC_STATUS_OK);
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "x");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {41});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
 
     auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
     ASSERT_NE(fs, nullptr);
-    ASSERT_TRUE(fs->ingest.has_value());
-    fs->ingest->ipc_bytes = {0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_TRUE(fs->bound.has_value());
 
     AdbcStatusCode rc = driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error);
     EXPECT_EQ(rc, ADBC_STATUS_IO) << "expected HTTP layer to reject the unreachable target";
 
-    EXPECT_FALSE(fs->ingest.has_value())
-        << "ingest state survived a failed ExecuteQuery; bound bytes would attach to next query";
+    EXPECT_FALSE(fs->bound.has_value()) << "ingest state survived a failed ExecuteQuery; bound data would attach to next query";
 
     if (error.release)
         error.release(&error);
@@ -1314,21 +1421,17 @@ TEST(StatementReuseTest, IngestStateClearedOnFailedExecute)
     driver.DatabaseRelease(&db, nullptr);
 }
 
-// Firebolt's HTTP interface has no parameter binding, and this driver's
-// Bind/BindStream exist only to carry a bulk-ingest payload.  When a caller
-// binds data with no ingest target — exactly what
-// `cursor.execute(sql, params)` does in the dbapi layer — ExecuteQuery used
-// to take the multipart-insert branch anyway (it keys on `ipc_bytes` alone),
-// POSTing the user's SELECT plus a data.arrow part.  The server then fails
-// with an opaque error about the upload.  Refuse it up front instead.
-TEST(StatementExecuteTest, BindWithoutIngestTargetRejected)
+// Bound data with no ingest target — what `cursor.execute(sql, params)` produces —
+// is a set of query parameters.  The multipart-insert branch keys on the ingest
+// target, not on the presence of a payload, so a SELECT picks up no data.arrow part.
+TEST(StatementExecuteTest, BindWithoutIngestTargetTakesParameterPath)
 {
     AdbcDriver driver = InitDriver();
     AdbcDatabase db{};
     AdbcError error = ADBC_ERROR_INIT;
     ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
-    // Unreachable port: if the request is attempted, the status is IO, not
-    // NOT_IMPLEMENTED, so this also proves nothing left the box.
+    // Unreachable port: reaching the HTTP layer shows as IO, which is how this
+    // test tells "sent as a parameterised query" from "refused up front".
     ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
     ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
 
@@ -1338,19 +1441,282 @@ TEST(StatementExecuteTest, BindWithoutIngestTargetRejected)
 
     AdbcStatement stmt{};
     ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
-    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT ?", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
 
-    // Simulate a parameter bind: payload present, no ingest target configured.
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "0");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {41});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+
     auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
     ASSERT_NE(fs, nullptr);
-    fs->initAndGetIngestState().ipc_bytes = {0xDE, 0xAD, 0xBE, 0xEF};
-    ASSERT_TRUE(fs->ingest->target_table.empty());
+    ASSERT_TRUE(fs->bound->target_table.empty());
 
     AdbcStatusCode rc = driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error);
-    EXPECT_EQ(rc, ADBC_STATUS_NOT_IMPLEMENTED) << "bound data with no ingest target must be refused, not sent as a multipart insert";
+    EXPECT_EQ(rc, ADBC_STATUS_IO) << "a bound parameter set must be sent as a parameterised query";
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// The target table decides the payload's destination, so ingest options arriving
+// without one are an incomplete request: discarding them silently turns a misspelled
+// target-table key into N parameterised executions of the caller's raw SQL.
+TEST(StatementExecuteTest, IngestOptionsWithoutTargetTableRejected)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    // Unreachable port: anything that reaches the HTTP layer shows up as IO, which
+    // is how this test tells "refused up front" from "sent as something else".
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
+    // Every ingest option except the target table — the shape a typo in the
+    // target-table key leaves behind.
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_REPLACE, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA, "public", &error), ADBC_STATUS_OK);
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "0");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {41});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+
+    EXPECT_EQ(driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error), ADBC_STATUS_INVALID_STATE)
+        << "ingest options without a target table must be an error, not a silent parameter binding";
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// ADBC does not order option calls, so the mode may legitimately be set before the
+// target table.  At option-set time the completeness check would reject this.
+TEST(StatementExecuteTest, IngestModeSetBeforeTargetTableStillIngests)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_MODE, ADBC_INGEST_OPTION_MODE_APPEND, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetOption(&stmt, ADBC_INGEST_OPTION_TARGET_TABLE, "events", &error), ADBC_STATUS_OK);
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "x");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {41});
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+
+    EXPECT_EQ(driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error), ADBC_STATUS_IO)
+        << "a complete ingest must reach the HTTP layer regardless of option order";
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// BindStream is single-pass and the caller may release its side once Bind returns,
+// so every batch has to be taken from the stream there and kept — one parameter set
+// per row across all of them.
+TEST(StatementExecuteTest, BindStreamRetainsEveryBatch)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
+
+    // Two batches behind one stream, as a record batch reader yields them.
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "0");
+    nanoarrow::UniqueArray first = MakeOneColumnBatch(schema.get(), {1, 2});
+    nanoarrow::UniqueArray second = MakeOneColumnBatch(schema.get(), {3});
+    nanoarrow::UniqueArrayStream stream;
+    ASSERT_EQ(ArrowBasicArrayStreamInit(stream.get(), schema.get(), 2), 0); // takes the schema
+    ArrowBasicArrayStreamSetArray(stream.get(), 0, first.get());
+    ArrowBasicArrayStreamSetArray(stream.get(), 1, second.get());
+
+    ASSERT_EQ(driver.StatementBindStream(&stmt, stream.get(), &error), ADBC_STATUS_OK);
+
+    auto * fs = static_cast<firebolt::adbc::FireboltStatement *>(stmt.private_data);
+    ASSERT_NE(fs, nullptr);
+    ASSERT_TRUE(fs->bound.has_value());
+    EXPECT_TRUE(fs->bound->data_bound);
+    EXPECT_EQ(fs->bound->batches.size(), 2u) << "a batch was left behind in the stream";
+
+    // A result-returning execution: with the batches dropped, no parameter set would
+    // be built and this would fail with INVALID_STATE without reaching the network.
+    ArrowArrayStream out{};
+    EXPECT_EQ(driver.StatementExecuteQuery(&stmt, &out, nullptr, &error), ADBC_STATUS_IO)
+        << "the retained batches must be rendered into parameter sets and sent";
+    if (out.release)
+        out.release(&out);
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// A parameter never travels as Arrow IPC, so binding must accept the view layouts
+// nanoarrow's IPC writer cannot encode — pyarrow produces `string_view` for anyone
+// who asks for it, and the value renders as an ordinary JSON string.
+TEST(StatementExecuteTest, StringViewParameterCanBeBound)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    // Unreachable port: IO means the parameter set was built and a request went out.
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_STRING_VIEW, "0");
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayAppendString(batch->children[0], ArrowCharView("hello")), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK)
+        << "a string_view column must be bindable: " << (error.message ? error.message : "");
+    if (error.release)
+        error.release(&error);
+
+    EXPECT_EQ(driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error), ADBC_STATUS_IO)
+        << "the bound string_view value must be rendered and sent";
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// A type Firebolt's query parameters cannot express has to be refused before any
+// request goes out, rather than sent as something the server would misread.
+TEST(StatementExecuteTest, UnrepresentableParameterRefusedBeforeAnyHttp)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
+
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_BINARY, "0");
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ArrowBufferView bytes{};
+    bytes.data.as_char = "\x01\x02";
+    bytes.size_bytes = 2;
+    ASSERT_EQ(ArrowArrayAppendBytes(batch->children[0], bytes), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+    ASSERT_EQ(driver.StatementBind(&stmt, batch.get(), schema.get(), &error), ADBC_STATUS_OK);
+
+    AdbcStatusCode rc = driver.StatementExecuteQuery(&stmt, nullptr, nullptr, &error);
+    EXPECT_EQ(rc, ADBC_STATUS_NOT_IMPLEMENTED) << "a binary parameter must be refused, not sent; got IO if it was sent";
     if (error.message)
-        EXPECT_NE(std::string(error.message).find("parameter"), std::string::npos)
-            << "error should point at parameter binding, got: " << error.message;
+        EXPECT_NE(std::string(error.message).find("binary"), std::string::npos)
+            << "error should name the offending type, got: " << error.message;
+
+    if (error.release)
+        error.release(&error);
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+}
+
+// Prepare must not talk to the server: driver managers call it whenever the query
+// text changes, so a round-trip here would double the request count of every
+// execute().  Against an unreachable endpoint that shows up as OK, not IO.
+TEST(StatementPrepareTest, PrepareIssuesNoRequest)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.DatabaseNew(&db, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseSetOption(&db, "uri", "http://127.0.0.1:1", &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.DatabaseInit(&db, &error), ADBC_STATUS_OK);
+
+    AdbcConnection conn{};
+    ASSERT_EQ(driver.ConnectionNew(&conn, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.ConnectionInit(&conn, &db, &error), ADBC_STATUS_OK);
+
+    AdbcStatement stmt{};
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+    ASSERT_EQ(driver.StatementSetSqlQuery(&stmt, "SELECT $1", &error), ADBC_STATUS_OK);
+    EXPECT_EQ(driver.StatementPrepare(&stmt, &error), ADBC_STATUS_OK) << "Prepare reached the network";
+
+    driver.StatementRelease(&stmt, nullptr);
+    driver.ConnectionRelease(&conn, nullptr);
+    driver.DatabaseRelease(&db, nullptr);
+    if (error.release)
+        error.release(&error);
+}
+
+// GetParameterSchema, by contrast, does need the server — but only when asked.
+TEST(StatementPrepareTest, GetParameterSchemaWithoutQueryFails)
+{
+    AdbcDriver driver = InitDriver();
+    AdbcDatabase db{};
+    AdbcConnection conn{};
+    SetupConnection(driver, db, conn);
+
+    AdbcStatement stmt{};
+    AdbcError error = ADBC_ERROR_INIT;
+    ASSERT_EQ(driver.StatementNew(&conn, &stmt, &error), ADBC_STATUS_OK);
+
+    ArrowSchema schema{};
+    EXPECT_EQ(driver.StatementGetParameterSchema(&stmt, &schema, &error), ADBC_STATUS_INVALID_STATE);
 
     if (error.release)
         error.release(&error);
@@ -1491,4 +1857,621 @@ TEST(AutocommitTest, CommitRollbackInAutocommitFails)
 
     driver.ConnectionRelease(&conn, nullptr);
     driver.DatabaseRelease(&db, nullptr);
+}
+
+// ============================================================
+// Tests: QueryParameters — Arrow values → query_parameters JSON
+// ============================================================
+// Firebolt derives each parameter's SQL type from the JSON type of its value, so
+// which values are quoted and which are not is load-bearing, not cosmetic.
+
+TEST(QueryParametersTest, IntegersAreJsonIntegers)
+{
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_INT64, 41), R"([{"name":"$1","value":41}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_INT32, -7), R"([{"name":"$1","value":-7}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_INT8, 127), R"([{"name":"$1","value":127}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_UINT32, 4294967295LL), R"([{"name":"$1","value":4294967295}])");
+    // The largest value the server can still read back as a BIGINT.
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_INT64, INT64_MAX), R"([{"name":"$1","value":9223372036854775807}])");
+}
+
+TEST(QueryParametersTest, BooleansAreJsonBooleans)
+{
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_BOOL, 1), R"([{"name":"$1","value":true}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_BOOL, 0), R"([{"name":"$1","value":false}])");
+}
+
+TEST(QueryParametersTest, NullIsAnUntypedJsonNull)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "0");
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayAppendNull(batch->children[0], 1), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":null}])");
+}
+
+// A double has to stay a JSON number with a fractional part: emitted as a bare "3"
+// the server would infer an integer parameter and substitute a BIGINT literal.
+TEST(QueryParametersTest, DoublesStayFloatingPoint)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_DOUBLE, "0");
+    const std::vector<std::pair<double, std::string>> cases = {
+        {1.5, "1.5"},
+        {3.0, "3.0"},
+        {-0.25, "-0.25"},
+        // Shortest round-trip: a plain %.17g would print 0.10000000000000001.
+        {0.1, "0.1"},
+        {1e300, "1e+300"},
+    };
+    for (const auto & [value, expected] : cases)
+    {
+        nanoarrow::UniqueArray batch;
+        ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+        ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayAppendDouble(batch->children[0], value), 0);
+        ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+        std::string json;
+        std::string error;
+        ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+        EXPECT_EQ(json, R"([{"name":"$1","value":)" + expected + "}]") << "value " << value;
+    }
+}
+
+TEST(QueryParametersTest, NonFiniteDoubleRejected)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_DOUBLE, "0");
+    const std::vector<double> values = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()};
+    for (double value : values)
+    {
+        nanoarrow::UniqueArray batch;
+        ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+        ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayAppendDouble(batch->children[0], value), 0);
+        ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+        std::string json;
+        std::string error;
+        // JSON has no NaN or Infinity literal, so there is nothing honest to send.
+        EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_INVALID_ARGUMENT);
+        EXPECT_NE(error.find("finite"), std::string::npos) << error;
+    }
+}
+
+// The server reads an integer parameter with std::stol, so a value above the
+// signed range has to be reported here, where the offending column is still known.
+TEST(QueryParametersTest, UnsignedOverflowRejected)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_UINT64, "0");
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayAppendUInt(batch->children[0], UINT64_MAX), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(error.find("BIGINT"), std::string::npos) << error;
+}
+
+TEST(QueryParametersTest, StringsAreEscaped)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_STRING, "0");
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"hello", R"("hello")"},
+        // A quote or a backslash must not end the JSON string early.
+        {"it's \"quoted\"", R"("it's \"quoted\"")"},
+        {"back\\slash", R"("back\\slash")"},
+        {"line\nbreak\ttab", R"("line\nbreak\ttab")"},
+        // A C0 control with no short escape.
+        {std::string("bell\x07"), R"("bell\u0007")"},
+        // UTF-8 passes through byte for byte.
+        {"\xD0\xBC\xD0\xBE\xD1\x88\xD0\xB0", "\"\xD0\xBC\xD0\xBE\xD1\x88\xD0\xB0\""},
+        // SQL syntax in a value is data: the server substitutes parameters into the
+        // validated AST, it does not splice text into the statement.
+        {"'; DROP TABLE t; --", R"("'; DROP TABLE t; --")"},
+    };
+    for (const auto & [value, expected] : cases)
+    {
+        nanoarrow::UniqueArray batch;
+        ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+        ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+        ArrowStringView sv{value.data(), static_cast<int64_t>(value.size())};
+        ASSERT_EQ(ArrowArrayAppendString(batch->children[0], sv), 0);
+        ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+        std::string json;
+        std::string error;
+        ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+        EXPECT_EQ(json, R"([{"name":"$1","value":)" + expected + "}]") << "value " << value;
+    }
+}
+
+// No JSON document can carry bytes that are not valid UTF-8, so such a string is
+// reported — naming the parameter set — rather than sent as something malformed.
+TEST(QueryParametersTest, InvalidUtf8StringRejected)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_STRING, "0");
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    // A lone continuation byte: never valid on its own.
+    const std::string invalid("bad\x80utf8", 8);
+    ArrowStringView sv{invalid.data(), static_cast<int64_t>(invalid.size())};
+    ASSERT_EQ(ArrowArrayAppendString(batch->children[0], sv), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(error.find("serialise"), std::string::npos) << error;
+}
+
+TEST(QueryParametersTest, DatesRenderAsIsoStrings)
+{
+    // Day 19727 is 2024-01-05; day 0 is the epoch, and -1 the day before it.
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_DATE32, 19727), R"([{"name":"$1","value":"2024-01-05"}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_DATE32, 0), R"([{"name":"$1","value":"1970-01-01"}])");
+    EXPECT_EQ(RenderOneIntegral(NANOARROW_TYPE_DATE32, -1), R"([{"name":"$1","value":"1969-12-31"}])");
+}
+
+TEST(QueryParametersTest, TimestampsRenderAsIsoStrings)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP, NANOARROW_TIME_UNIT_MICRO, nullptr), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+
+    // 2024-01-05 06:07:08.123456 UTC
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {1704434828123456LL});
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"2024-01-05 06:07:08.123456"}])");
+
+    // A whole second spends no characters on a fraction.
+    nanoarrow::UniqueArray whole = MakeOneColumnBatch(schema.get(), {1704434828000000LL});
+    ASSERT_EQ(RenderParameterSet(schema.get(), whole.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"2024-01-05 06:07:08"}])");
+
+    // Before the epoch the split into day and time-of-day must floor rather than
+    // truncate towards zero.
+    nanoarrow::UniqueArray before = MakeOneColumnBatch(schema.get(), {-1});
+    ASSERT_EQ(RenderParameterSet(schema.get(), before.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"1969-12-31 23:59:59.999999"}])");
+}
+
+// Arrow stores a zoned timestamp as a UTC instant.  Say so, or the server reads it
+// as a wall-clock time in whatever zone the session is using.
+TEST(QueryParametersTest, ZonedTimestampCarriesItsOffset)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP, NANOARROW_TIME_UNIT_SECOND, "America/New_York"), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {1704434828LL});
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"2024-01-05 06:07:08+00"}])");
+}
+
+TEST(QueryParametersTest, TimesRenderAsClockStrings)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIME64, NANOARROW_TIME_UNIT_MICRO, nullptr), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {(13 * 3600 + 14 * 60 + 15) * 1000000LL + 500});
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"13:14:15.000500"}])");
+}
+
+// hh_mm_ss reports the magnitude of a negative duration, which would render as a
+// plausible-looking time with the sign dropped.
+TEST(QueryParametersTest, NegativeTimeOfDayRejected)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIME64, NANOARROW_TIME_UNIT_MICRO, nullptr), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {-1});
+    std::string json;
+    std::string error;
+    EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_INVALID_ARGUMENT);
+    EXPECT_NE(error.find("time of day"), std::string::npos) << error;
+}
+
+// date64 counts milliseconds, so it has to floor to the day it falls in — including
+// before the epoch, where truncation towards zero would land a day late.
+TEST(QueryParametersTest, Date64FloorsToItsDay)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_DATE64, "0");
+    // Midday on 2024-01-05, then one millisecond before the epoch.
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {19727LL * 86400000LL + 43200000LL, -1LL});
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"2024-01-05"}])");
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 1, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"1969-12-31"}])");
+}
+
+// A decimal travels as a string: sent as a JSON number the server would read it
+// back through std::stod, quietly rounding anything a double cannot hold exactly.
+TEST(QueryParametersTest, DecimalsRenderAsExactStrings)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+    ASSERT_EQ(ArrowSchemaSetTypeDecimal(schema->children[0], NANOARROW_TYPE_DECIMAL128, 38, 9), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ArrowDecimal decimal{};
+    ArrowDecimalInit(&decimal, 128, 38, 9);
+    ASSERT_EQ(ArrowDecimalSetDigits(&decimal, ArrowCharView("-12345678901234567890123456789")), 0);
+    ASSERT_EQ(ArrowArrayAppendDecimal(batch->children[0], &decimal), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":"-12345678901234567890.123456789"}])");
+}
+
+// Types the mechanism cannot express are refused by name rather than misread — a
+// JSON array arrives as pretty-printed TEXT, not an ARRAY.
+TEST(QueryParametersTest, UnrepresentableTypesRejected)
+{
+    const std::vector<std::pair<ArrowType, std::string>> cases = {
+        {NANOARROW_TYPE_BINARY, "binary"},
+        {NANOARROW_TYPE_LARGE_BINARY, "binary"},
+        {NANOARROW_TYPE_LIST, "list"},
+        {NANOARROW_TYPE_INTERVAL_MONTHS, "interval"},
+    };
+    for (const auto & [column_type, expected_word] : cases)
+    {
+        nanoarrow::UniqueSchema schema = MakeTopLevelSchema(1);
+        ASSERT_EQ(ArrowSchemaSetType(schema->children[0], column_type), 0) << ArrowTypeString(column_type);
+        ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+        if (column_type == NANOARROW_TYPE_LIST)
+            ASSERT_EQ(ArrowSchemaSetType(schema->children[0]->children[0], NANOARROW_TYPE_INT32), 0);
+
+        // Append a null — the one element every type can build — then mark it
+        // present, since a null renders as JSON null without the type being read.
+        nanoarrow::UniqueArray batch;
+        ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+        ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayAppendNull(batch->children[0], 1), 0);
+        ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+        ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+        ArrowBitSet(const_cast<uint8_t *>(static_cast<const uint8_t *>(batch->children[0]->buffers[0])), 0);
+        batch->children[0]->null_count = 0;
+
+        std::string json;
+        std::string error;
+        EXPECT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_NOT_IMPLEMENTED)
+            << "type " << ArrowTypeString(column_type);
+        EXPECT_NE(error.find(expected_word), std::string::npos) << error;
+    }
+}
+
+TEST(QueryParametersTest, PositionalNamesFollowColumnOrder)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(2);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64), 0);
+    // The dbapi layer names bound columns "0", "1", …; positional binding ignores
+    // those names and uses ordinal position, which is what `$N` resolves against.
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "0"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[1], NANOARROW_TYPE_STRING), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[1], "1"), 0);
+
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayAppendInt(batch->children[0], 7), 0);
+    ASSERT_EQ(ArrowArrayAppendString(batch->children[1], ArrowCharView("ann")), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, false, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":7},{"name":"$2","value":"ann"}])");
+
+    // By name, each parameter is carried under its column's name *as well as* its
+    // position — so param('who') resolves without `$2` ceasing to.
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "id"), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[1], "who"), 0);
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, true, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":7},{"name":"id","value":7},{"name":"$2","value":"ann"},{"name":"who","value":"ann"}])");
+}
+
+// A driver manager sends bind_by_name only when its own idea of it changes, and
+// dbapi never revises it once parameters arrive as Arrow data, so a stale `true` is
+// unavoidable.  It must not leave the `$N` placeholders unbound.
+TEST(QueryParametersTest, StaleBindByNameStillBindsPositionally)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "c");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {7});
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, true, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":7},{"name":"c","value":7}])")
+        << "a stale bind_by_name must add a name, not replace the positional one";
+}
+
+// Duplicate names are a server-side error, so an alias that collides with a
+// positional name — or with another column's — is dropped rather than sent.
+TEST(QueryParametersTest, BindByNameSkipsCollidingAliases)
+{
+    nanoarrow::UniqueSchema schema = MakeTopLevelSchema(2);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64), 0);
+    // A column literally named like the second positional parameter.
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "$2"), 0);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[1], NANOARROW_TYPE_INT64), 0);
+    ASSERT_EQ(ArrowSchemaSetName(schema->children[1], "dup"), 0);
+
+    nanoarrow::UniqueArray batch;
+    ASSERT_EQ(ArrowArrayInitFromSchema(batch.get(), schema.get(), nullptr), 0);
+    ASSERT_EQ(ArrowArrayStartAppending(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayAppendInt(batch->children[0], 1), 0);
+    ASSERT_EQ(ArrowArrayAppendInt(batch->children[1], 2), 0);
+    ASSERT_EQ(ArrowArrayFinishElement(batch.get()), 0);
+    ASSERT_EQ(ArrowArrayFinishBuilding(batch.get(), NANOARROW_VALIDATION_LEVEL_DEFAULT, nullptr), 0);
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, true, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":1},{"name":"$2","value":2},{"name":"dup","value":2}])")
+        << "the \"$2\" alias collides with the second positional name and must be dropped";
+}
+
+TEST(QueryParametersTest, EachRowIsItsOwnParameterSet)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "0");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {10, 20, 30});
+
+    std::string error;
+    for (int64_t row = 0; row < 3; ++row)
+    {
+        std::string json;
+        ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), row, false, json, error), ADBC_STATUS_OK) << error;
+        EXPECT_EQ(json, R"([{"name":"$1","value":)" + std::to_string((row + 1) * 10) + "}]");
+    }
+}
+
+// An unnamed column has no alias to offer, which is not a reason to fail the whole
+// parameter set: the positional name still reaches the server.
+TEST(QueryParametersTest, BindByNameToleratesUnnamedColumns)
+{
+    nanoarrow::UniqueSchema schema = MakeStructSchemaWithColumn(NANOARROW_TYPE_INT64, "");
+    nanoarrow::UniqueArray batch = MakeOneColumnBatch(schema.get(), {1});
+
+    std::string json;
+    std::string error;
+    ASSERT_EQ(RenderParameterSet(schema.get(), batch.get(), 0, true, json, error), ADBC_STATUS_OK) << error;
+    EXPECT_EQ(json, R"([{"name":"$1","value":1}])");
+}
+
+// ============================================================
+// Tests: DescribeParameters — describe response → Arrow schema
+// ============================================================
+
+namespace
+{
+
+// The shape the server produces: a compact JSON dump of result_columns and
+// parameter_types, carried as one string cell of a one-row result.
+std::string DescribeJson(const std::string & result_columns, const std::string & parameter_types)
+{
+    return R"({"result_columns":)" + result_columns + R"(,"parameter_types":)" + parameter_types + "}";
+}
+
+// The Arrow format string a Firebolt type name maps to.
+std::string ArrowFormatFor(const std::string & type_name)
+{
+    ArrowSchema schema{};
+    std::string error;
+    EXPECT_EQ(firebolt::adbc::fireboltTypeNameToArrowSchema(type_name, &schema, error), ADBC_STATUS_OK) << error;
+    std::string format = schema.format ? schema.format : "";
+    if (schema.release)
+        schema.release(&schema);
+    return format;
+}
+
+} // namespace
+
+TEST(DescribeParametersTest, ExtractsParameterTypes)
+{
+    firebolt::adbc::ParameterTypeList params;
+    std::string error;
+    ASSERT_EQ(
+        firebolt::adbc::extractParameterTypes(
+            DescribeJson(R"([{"name":"n","type":"integer"}])", R"({"$1":"integer","$2":"text null"})"), params, error),
+        ADBC_STATUS_OK)
+        << error;
+    ASSERT_EQ(params.size(), 2u);
+    EXPECT_EQ(params[0].first, "$1");
+    EXPECT_EQ(params[0].second, "integer");
+    EXPECT_EQ(params[1].first, "$2");
+    EXPECT_EQ(params[1].second, "text null");
+}
+
+TEST(DescribeParametersTest, NoParametersIsNotAnError)
+{
+    firebolt::adbc::ParameterTypeList params;
+    std::string error;
+    // A statement without placeholders: the member is present but empty, and on
+    // some paths null.
+    EXPECT_EQ(firebolt::adbc::extractParameterTypes(DescribeJson("[]", "{}"), params, error), ADBC_STATUS_OK) << error;
+    EXPECT_TRUE(params.empty());
+    EXPECT_EQ(firebolt::adbc::extractParameterTypes(DescribeJson("[]", "null"), params, error), ADBC_STATUS_OK) << error;
+    EXPECT_TRUE(params.empty());
+    // And a response carrying only result columns.
+    EXPECT_EQ(firebolt::adbc::extractParameterTypes(R"({"result_columns":[{"name":"n","type":"integer"}]})", params, error), ADBC_STATUS_OK)
+        << error;
+    EXPECT_TRUE(params.empty());
+}
+
+// `SELECT 1 AS parameter_types` puts that name inside result_columns; searching for
+// the key rather than walking the structure would read the column list as the map.
+TEST(DescribeParametersTest, ResultColumnNamedLikeTheKeyDoesNotConfuseTheReader)
+{
+    firebolt::adbc::ParameterTypeList params;
+    std::string error;
+    ASSERT_EQ(
+        firebolt::adbc::extractParameterTypes(
+            DescribeJson(R"([{"name":"parameter_types","type":"integer"}])", R"({"$1":"bigint"})"), params, error),
+        ADBC_STATUS_OK)
+        << error;
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(params[0].first, "$1");
+    EXPECT_EQ(params[0].second, "bigint");
+}
+
+// Braces and quotes inside a column name must not throw off the bracket matching
+// that skips over the result_columns array.
+TEST(DescribeParametersTest, StructuralCharactersInsideStringsAreSkipped)
+{
+    firebolt::adbc::ParameterTypeList params;
+    std::string error;
+    ASSERT_EQ(
+        firebolt::adbc::extractParameterTypes(
+            DescribeJson(R"([{"name":"}] \"parameter_types\":{","type":"text"}])", R"({"$1":"date"})"), params, error),
+        ADBC_STATUS_OK)
+        << error;
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(params[0].second, "date");
+}
+
+TEST(DescribeParametersTest, MalformedJsonIsReported)
+{
+    firebolt::adbc::ParameterTypeList params;
+    std::string error;
+    const std::vector<std::string> bad_inputs = {"", "not json", R"({"parameter_types":)", R"({"parameter_types":{"$1":42}})"};
+    for (const auto & bad : bad_inputs)
+    {
+        EXPECT_EQ(firebolt::adbc::extractParameterTypes(bad, params, error), ADBC_STATUS_INTERNAL) << "input: " << bad;
+        EXPECT_FALSE(error.empty());
+    }
+}
+
+TEST(DescribeParametersTest, TypeNamesMapToArrowTypes)
+{
+    EXPECT_EQ(ArrowFormatFor("integer"), "i");
+    EXPECT_EQ(ArrowFormatFor("INT"), "i");
+    EXPECT_EQ(ArrowFormatFor("bigint"), "l");
+    EXPECT_EQ(ArrowFormatFor("long"), "l");
+    EXPECT_EQ(ArrowFormatFor("real"), "f");
+    EXPECT_EQ(ArrowFormatFor("double precision"), "g");
+    EXPECT_EQ(ArrowFormatFor("boolean"), "b");
+    EXPECT_EQ(ArrowFormatFor("text"), "u");
+    EXPECT_EQ(ArrowFormatFor("bytea"), "z");
+    EXPECT_EQ(ArrowFormatFor("date"), "tdD");
+    EXPECT_EQ(ArrowFormatFor("timestamp"), "tsu:");
+    EXPECT_EQ(ArrowFormatFor("timestampntz"), "tsu:");
+    EXPECT_EQ(ArrowFormatFor("timestamptz"), "tsu:UTC");
+    EXPECT_EQ(ArrowFormatFor("decimal(38, 9)"), "d:38,9");
+    EXPECT_EQ(ArrowFormatFor("numeric(10,2)"), "d:10,2");
+    EXPECT_EQ(ArrowFormatFor("array(integer)"), "+l");
+    // A name the driver does not know: ADBC asks for NA rather than a guess.
+    EXPECT_EQ(ArrowFormatFor("geography"), "n");
+    EXPECT_EQ(ArrowFormatFor("unknown"), "n");
+}
+
+TEST(DescribeParametersTest, TrailingNullMarksTheFieldNullable)
+{
+    ArrowSchema schema{};
+    std::string error;
+    ASSERT_EQ(firebolt::adbc::fireboltTypeNameToArrowSchema("integer null", &schema, error), ADBC_STATUS_OK) << error;
+    EXPECT_STREQ(schema.format, "i");
+    EXPECT_TRUE(schema.flags & ARROW_FLAG_NULLABLE);
+    schema.release(&schema);
+
+    ASSERT_EQ(firebolt::adbc::fireboltTypeNameToArrowSchema("integer", &schema, error), ADBC_STATUS_OK) << error;
+    EXPECT_FALSE(schema.flags & ARROW_FLAG_NULLABLE);
+    schema.release(&schema);
+}
+
+TEST(DescribeParametersTest, NestedArraysRecurse)
+{
+    ArrowSchema schema{};
+    std::string error;
+    ASSERT_EQ(firebolt::adbc::fireboltTypeNameToArrowSchema("array(array(integer))", &schema, error), ADBC_STATUS_OK) << error;
+    EXPECT_STREQ(schema.format, "+l");
+    ASSERT_EQ(schema.n_children, 1);
+    EXPECT_STREQ(schema.children[0]->format, "+l");
+    EXPECT_STREQ(schema.children[0]->name, "item");
+    ASSERT_EQ(schema.children[0]->n_children, 1);
+    EXPECT_STREQ(schema.children[0]->children[0]->format, "i");
+    schema.release(&schema);
+}
+
+// Ordinal position, not name order: sorted as text, "$10" lands before "$2" — as it
+// does in the server's own PostgreSQL ParameterDescription.
+TEST(DescribeParametersTest, ParameterSchemaIsOrderedByOrdinalPosition)
+{
+    std::string types = "{";
+    for (int i = 1; i <= 11; ++i)
+        types += (i > 1 ? "," : "") + std::string("\"$") + std::to_string(i) + "\":\"integer\"";
+    types += "}";
+
+    ArrowSchema schema{};
+    std::string error;
+    ASSERT_EQ(firebolt::adbc::buildParameterSchema(DescribeJson("[]", types), &schema, error), ADBC_STATUS_OK) << error;
+    ASSERT_EQ(schema.n_children, 11);
+    for (int i = 0; i < 11; ++i)
+        EXPECT_STREQ(schema.children[i]->name, ("$" + std::to_string(i + 1)).c_str()) << "field " << i;
+    schema.release(&schema);
+}
+
+TEST(DescribeParametersTest, ParameterSchemaCarriesNamesAndTypes)
+{
+    ArrowSchema schema{};
+    std::string error;
+    ASSERT_EQ(firebolt::adbc::buildParameterSchema(DescribeJson("[]", R"({"$1":"integer","$2":"text"})"), &schema, error), ADBC_STATUS_OK)
+        << error;
+    EXPECT_STREQ(schema.format, "+s");
+    ASSERT_EQ(schema.n_children, 2);
+    EXPECT_STREQ(schema.children[0]->name, "$1");
+    EXPECT_STREQ(schema.children[0]->format, "i");
+    EXPECT_STREQ(schema.children[1]->name, "$2");
+    EXPECT_STREQ(schema.children[1]->format, "u");
+    schema.release(&schema);
+
+    // Every parameter field is nullable whatever the server reported: NULL binds to
+    // any parameter, and a caller builds its batch from this schema.  A `NOT NULL`
+    // column the placeholder was compared against says nothing about that.
+    ASSERT_EQ(
+        firebolt::adbc::buildParameterSchema(DescribeJson("[]", R"({"$1":"integer","$2":"text null"})"), &schema, error), ADBC_STATUS_OK)
+        << error;
+    ASSERT_EQ(schema.n_children, 2);
+    EXPECT_TRUE(schema.children[0]->flags & ARROW_FLAG_NULLABLE) << "a non-nullable parameter field cannot be bound a NULL";
+    EXPECT_TRUE(schema.children[1]->flags & ARROW_FLAG_NULLABLE);
+    schema.release(&schema);
+
+    // A statement with no placeholders has an empty parameter schema, not an error.
+    ASSERT_EQ(firebolt::adbc::buildParameterSchema(DescribeJson("[]", "{}"), &schema, error), ADBC_STATUS_OK) << error;
+    EXPECT_STREQ(schema.format, "+s");
+    EXPECT_EQ(schema.n_children, 0);
+    schema.release(&schema);
 }

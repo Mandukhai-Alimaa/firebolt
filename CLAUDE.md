@@ -44,11 +44,13 @@ Private for now; it will be made public once it is ready.
 │   ├── FireboltAdbcDriver.cpp             # ADBC function table, entry point, curl init/cleanup
 │   ├── FireboltAdbcDatabase.h             # FireboltDatabase struct (AdbcDatabase::private_data)
 │   ├── FireboltAdbcConnection.h           # FireboltConnection struct; owns HttpClient + session state
-│   ├── FireboltAdbcStatement.h            # FireboltStatement struct; holds SQL + bound IPC bytes
+│   ├── FireboltAdbcStatement.h            # FireboltStatement struct; SQL, bound Arrow batches, ingest target
 │   ├── FireboltAdbcMetadata.h/.cpp        # GetInfo, GetTableTypes, GetTableSchema, GetObjects
 │   ├── HttpClient.h/.cpp                  # libcurl wrapper: query POST, multipart insert, session headers
 │   ├── HttpHeaderParse.h/.cpp             # session-state response header parsing
 │   ├── IngestSqlBuilder.h/.cpp            # identifier quoting, Arrow→Firebolt types, ingest DDL/DML
+│   ├── QueryParameters.h/.cpp             # bound Arrow row → `query_parameters` JSON ($1, $2, …)
+│   ├── DescribeParameters.h/.cpp          # describe_parameters JSON → ADBC parameter schema
 │   ├── ScopeGuard.h                       # RAII exit guard
 │   ├── Version.h.in                       # → build/generated/Version.h; FIREBOLT_ADBC_VERSION
 │   └── ArrowIpcStream.h/.cpp              # Arrow IPC bytes → ArrowArrayStream via nanoarrow 0.8.0
@@ -94,6 +96,8 @@ Private for now; it will be made public once it is ready.
             ├── dml/test.py                # DDL, INSERT/SELECT, aggregates, type roundtrip
             ├── ingest/test.py             # bulk ingest via dbapi Cursor.adbc_ingest()
             ├── ingest_low_level/test.py   # bulk ingest via set_options + bind_stream
+            ├── prepared_statements/test.py # parameter schema; request budget via mock_server
+            ├── query_params/test.py       # $N binding: types, values, executemany, param('name')
             ├── security_*/test.py         # regression tests for fixed security issues
             └── struct_type/test.py        # STRUCT / ARRAY(STRUCT) retrieval and ingest
 ```
@@ -175,6 +179,20 @@ setup would bind-mount a `config.yaml` at `/var/lib/firebolt/config.yaml`.
 - **Static third-party deps** — `curl`, `BoringSSL`, `c-ares`, `nanoarrow`, and test
   dependencies are linked statically from `submodule` build outputs. System runtime
   libs (e.g. `libc`, `libm`, `libdl`, `libpthread`) remain dynamic.
+- **JSON goes through `nlohmann/json`, not hand-rolled parsing** — two protocol
+  surfaces are JSON: the `query_parameters` setting the driver writes and the
+  `describe_parameters` payload it reads. The library owns escaping, UTF-8 validation
+  and number formatting; it is header-only, so it costs nothing at link time, and it
+  is the version packdb vendors. Not delegated: which JSON type each Arrow value
+  becomes, since the server infers a parameter's SQL type from it.
+- **Calendar arithmetic goes through C++20 `<chrono>`** — `QueryParameters.cpp` renders
+  date, time and timestamp parameters as text. The error-prone parts (civil date from
+  a day count, splitting an instant into day plus time of day, flooring rather than
+  truncating before 1970) are `sys_days`, `year_month_day`, `hh_mm_ss` and
+  `floor<days>`, available in both supported toolchains. Their *formatters* are not —
+  libstdc++ gained those in 13, and the builder image has 11 — so digits go through
+  `snprintf` and `withTimeUnit` dispatches an Arrow time unit to its duration type.
+  Hence no vendored date library.
 - **Version script** (`firebolt_adbc.version`) — exports only `AdbcDriverInit` and
   `FireboltAdbcDriverInit`; all other symbols (including libc++ internals) are hidden.
 - **Post-build dependency report** — every build prints concise `DT_NEEDED` `.so` names
@@ -229,10 +247,50 @@ setup would bind-mount a `config.yaml` at `/var/lib/firebolt/config.yaml`.
 - **TLS capability is asked of libcurl, not tracked in a define** — `curl_version_info`
   reports whether the linked curl has SSL, so the `https://` rejection is always correct
   for the library actually loaded rather than for what the build flags claimed.
-- **Parameter binding is refused explicitly** — Firebolt's HTTP interface has none, and
-  `Bind`/`BindStream` here exist only to carry an ingest payload. Bound data with no
-  ingest target returns `ADBC_STATUS_NOT_IMPLEMENTED` instead of silently taking the
-  multipart path and failing server-side with an opaque upload error.
+- **Query parameters ride the same channel as session settings** — binding sends the
+  values in the `query_parameters` query setting, a JSON array of
+  `{"name": "$1", "value": …}`, and the server substitutes each `$N` into the *parsed*
+  statement (`SqlExprValidator::_visit_parameter` in packdb). Nothing is spliced into
+  SQL text, so the only escaping that matters is JSON escaping. This is the mechanism
+  packdb's own PostgreSQL-wire handler and the `fb` CLI's `--param` both use. Bound
+  data serves two paths, told apart by whether an ingest target table is set: with one
+  it is a multipart ingest payload, without one it is query parameters, one execution
+  per bound row. Since that option decides the destination, ingest options arriving
+  *without* a target table are refused at execute time — checked there, not where the
+  options arrive, since ADBC does not order option calls.
+- **Bind keeps Arrow arrays; only ingest encodes IPC** — `BoundData` holds the bound
+  `ArrowArray` batches, and `SerializeBoundData` runs in the ingest branch of
+  `StatementExecuteQuery`, the only consumer of the bytes. Encoding at bind time would
+  cost every parameterised execution an encode plus decode of data that leaves as
+  JSON, and would refuse any layout nanoarrow's IPC writer cannot encode — Arrow's
+  view layouts among them. `BindStream` drains its stream on the spot, a stream being
+  single-pass. "Data was supplied" is `data_bound`, not a non-empty batch list, so a
+  zero-batch ingest still uploads a schema-only payload and creates an empty table.
+- **A parameter's SQL type is the JSON type of its value** — the format has no type
+  field, so `int`→BIGINT, JSON number→DOUBLE, bool→BOOLEAN, `null`→untyped NULL,
+  string→TEXT. Hence `QueryParameters.cpp` keeps a `.0` on whole doubles (a bare `3`
+  would arrive as a BIGINT), sends decimals as strings (a JSON number is read back
+  through `std::stod`, which rounds), and refuses `binary`/nested types by name
+  instead of sending something the server would misread.
+- **Prepare issues no request; GetParameterSchema does** — there is no server-side
+  prepare, and ADBC makes `Prepare` optional, so it stays local: driver managers call
+  it on every query-text change, and a round-trip there would double the request count
+  of every `execute()`. Parameter types come from re-sending the statement with
+  `execution_mode=describe_parameters`, minus the
+  `transaction_id`/`transaction_sequence_id` session parameters, so type inference
+  never spends a transaction step on a statement the caller never ran.
+- **Nothing about a statement is cached across executions** — neither the describe
+  payload nor a bound payload. DDL from any connection changes a placeholder's type
+  without changing a character of the query, and a driver manager re-issues
+  `SetSqlQuery` only on a text change (dbapi skips it when `operation ==
+  self._last_query`), so a cache keyed on the SQL would outlive its truth with no
+  invalidation event the driver can see.
+- **A statement option a driver manager may leave stale must only ever add behaviour**
+  — `bind_by_name` is the case in point: dbapi sends it once per cursor and never
+  revises it when parameters arrive as Arrow data, so it cannot be trusted to describe
+  the current call. `buildQueryParametersJson` therefore always emits the positional
+  `$N` names and treats the option as a request for *extra* aliases, making a stale
+  `true` cost one unreferenced parameter rather than unbinding every placeholder.
 
 ## Dependencies
 
@@ -245,7 +303,12 @@ All required non-system deps are expected under `submodule`:
 | BoringSSL | `build/submodule/boringssl/libssl.a`, `libcrypto.a` |
 | c-ares | `build/submodule/c-ares/src/lib/libcares.a` |
 | nanoarrow source | `submodule/nanoarrow` |
+| nlohmann/json (header-only) | `submodule/json/single_include` |
 | googletest source (tests) | `submodule/googletest` |
+
+`nlohmann/json` is pinned to `v3.12.0`, the version packdb vendors, and included as a
+SYSTEM directory so its headers are exempt from this project's warnings. Header-only:
+nothing is added to the link line.
 
 ## ADBC Options Reference
 
@@ -260,6 +323,7 @@ error status, and the full Arrow→Firebolt type mapping. Summary only here.
 | `"adbc.firebolt.timeout_sec"` | Database | Total request timeout in whole seconds; `0` (the default) disables it |
 | `ADBC_CONNECTION_OPTION_AUTOCOMMIT` | Connection | `false` enables explicit transactions: lazy `BEGIN`, then `Commit`/`Rollback` |
 | `ADBC_INGEST_OPTION_TARGET_TABLE` | Statement | Target table for the bind-data ingest path; auto-generates `INSERT INTO {target} ({cols}) SELECT * FROM read_arrow('upload://data.arrow')` on `ExecuteUpdate` |
+| `"adbc.statement.bind_by_name"` | Statement | `true` additionally names bound parameters after their columns (for `param('name')`); the positional `$N` names are always sent too, so a stale setting cannot unbind a placeholder. Only the canonical `true`/`false` accepted. Absent from the vendored ADBC 1.1.0 header, so defined locally |
 | Unknown keys on `ConnectionSetOption` after init | Connection | Stored as session params appended to query URL |
 
 `ADBC_INGEST_OPTION_MODE` (append / create / replace / create_append) and the
@@ -271,6 +335,11 @@ the high-level `adbc_driver_manager.dbapi.Cursor.adbc_ingest()` and the
 low-level `bind_stream` + `execute_update` path land data in the target table
 (`tests/integration/tests/ingest/`, `ingest_low_level/`, `struct_type/`;
 `dml/test.py` covers INSERT-via-SQL).
+
+Query parameters use Firebolt's positional `$1`, `$2`, … placeholders — not `?` or
+`%s` — carried in the `query_parameters` query setting. `StatementGetParameterSchema`
+reports the types the server infers via `execution_mode=describe_parameters`
+(`tests/integration/tests/query_params/`, `prepared_statements/`).
 
 ## HTTP Protocol
 

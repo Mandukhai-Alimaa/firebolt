@@ -82,8 +82,7 @@ TEST(SessionStateTest, ResetIgnoredOnError)
     auto resp = makeError(503);
     resp.reset_session = true;
     EXPECT_FALSE(firebolt::adbc::applySessionUpdatesIfSuccess(session, resp));
-    EXPECT_EQ(session["existing"], "yes")
-        << "5xx + Firebolt-Reset-Session must NOT clear pre-existing session state";
+    EXPECT_EQ(session["existing"], "yes") << "5xx + Firebolt-Reset-Session must NOT clear pre-existing session state";
 }
 
 TEST(SessionStateTest, NoSessionMutationOnCurlError)

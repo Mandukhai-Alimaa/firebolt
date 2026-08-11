@@ -193,7 +193,7 @@ std::string buildCreateTableColumns(const ArrowSchema * top_level_schema)
 AdbcStatusCode
 buildIngestSql(const FireboltStatement * fs, std::vector<std::string> & out_pre_sql, std::string & out_insert_sql, AdbcError * error)
 {
-    const BulkIngestState & ingest = *fs->ingest;
+    const BoundData & ingest = *fs->bound;
     const ArrowSchema * top = ingest.schema.get();
     const bool have_schema = top && top->release && top->n_children > 0;
 

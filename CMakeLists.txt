@@ -41,6 +41,8 @@ set(_boringssl_src "${ADBC_SUBMODULE_DIR}/boringssl")
 set(_boringssl_build "${CMAKE_CURRENT_BINARY_DIR}/submodule/boringssl")
 set(_nanoarrow_src "${ADBC_SUBMODULE_DIR}/nanoarrow")
 set(_gtest_src     "${ADBC_SUBMODULE_DIR}/googletest")
+# nlohmann/json is header-only: no build, just its single-header include directory.
+set(_json_include  "${ADBC_SUBMODULE_DIR}/json/single_include")
 # Keep explicit archive paths for curl's OpenSSL detection hints.
 set(_boringssl_ssl_archive    "${_boringssl_build}/libssl.a")
 set(_boringssl_crypto_archive "${_boringssl_build}/libcrypto.a")
@@ -49,6 +51,7 @@ require_dir("${ADBC_SUBMODULE_DIR}" "ADBC submodule root")
 require_dir("${_curl_src}" "curl source submodule")
 require_dir("${_cares_src}" "c-ares source submodule")
 require_dir("${_nanoarrow_src}" "nanoarrow source submodule")
+require_dir("${_json_include}" "nlohmann/json source submodule")
 if (WITH_SSL)
     require_dir("${_boringssl_src}" "BoringSSL source submodule")
 endif ()
@@ -255,6 +258,8 @@ add_library(firebolt_adbc SHARED
     src/HttpHeaderParse.cpp
     src/ArrowIpcStream.cpp
     src/IngestSqlBuilder.cpp
+    src/QueryParameters.cpp
+    src/DescribeParameters.cpp
 )
 
 set_target_properties(firebolt_adbc PROPERTIES
@@ -269,6 +274,9 @@ target_include_directories(firebolt_adbc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
+
+# SYSTEM so nlohmann/json's own headers are exempt from this project's warnings.
+target_include_directories(firebolt_adbc SYSTEM PRIVATE ${_json_include})
 
 target_link_libraries(firebolt_adbc PRIVATE
     ${_curl_target}
@@ -331,12 +339,16 @@ if (FIREBOLT_ADBC_BUILD_TESTS)
         src/ArrowIpcStream.cpp
         src/IngestSqlBuilder.cpp
         src/HttpHeaderParse.cpp
+        src/QueryParameters.cpp
+        src/DescribeParameters.cpp
     )
 
     target_include_directories(adbc_driver_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
+
+    target_include_directories(adbc_driver_tests SYSTEM PRIVATE ${_json_include})
 
     target_link_libraries(adbc_driver_tests PRIVATE
         ${_gtest_main_target}

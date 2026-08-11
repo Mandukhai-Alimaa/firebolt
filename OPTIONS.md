@@ -78,16 +78,123 @@ trusted (`src/HttpClient.cpp`, `applySessionUpdatesIfSuccess`).
 
 ## Statement options
 
-Set on `AdbcStatement`. All of these configure bulk ingest; the driver has no
-other statement options.
+Set on `AdbcStatement`.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
+| `adbc.statement.bind_by_name` | `false` | `true` additionally carries each parameter under its bound column's name, for statements reading it through `param('name')`. Positional `$N` names are always sent regardless, so this only ever adds a naming. Must be exactly `"true"` or `"false"`; anything else is `ADBC_STATUS_INVALID_ARGUMENT`. See [Query parameters](#query-parameters). |
 | `adbc.ingest.target_table` | — | Target table. Setting it switches `ExecuteUpdate`/`ExecuteQuery` to the ingest path, which generates `INSERT INTO <target> (<cols>) SELECT * FROM read_arrow('upload://data.arrow')` and uploads the bound Arrow data as a multipart request. |
 | `adbc.ingest.target_catalog` | — | Catalog qualifier for the target table. |
 | `adbc.ingest.target_db_schema` | — | Schema qualifier for the target table. |
 | `adbc.ingest.mode` | `adbc.ingest.mode.create` | One of `adbc.ingest.mode.append`, `.create`, `.replace`, `.create_append`. Any other value is `ADBC_STATUS_INVALID_ARGUMENT`. |
 | `adbc.ingest.temporary` | — | Only `false` (or empty) is accepted, as a no-op — the Python dbapi layer sends it by default. `true` returns `ADBC_STATUS_NOT_IMPLEMENTED`: Firebolt has no session-temporary tables. |
+
+Bound Arrow data serves both paths, told apart by whether an ingest target table is
+set: with one it is a bulk-ingest payload, without one it is query parameters. So
+`adbc.ingest.mode`, `adbc.ingest.target_catalog` or `adbc.ingest.target_db_schema`
+without `adbc.ingest.target_table` is `ADBC_STATUS_INVALID_STATE` at execution time,
+not a silent parameter binding. Option order does not matter.
+
+## Query parameters
+
+Placeholders are **positional and written `$1`, `$2`, …** — Firebolt's own syntax.
+`?`, `%s` and `:name` are not placeholders, and `$foo` lexes as an identifier.
+
+The driver does not interpolate values into your SQL. They travel in the
+`query_parameters` setting, a JSON array beside the statement, and the server
+substitutes each into the *parsed* statement as a literal node — so a value
+containing quotes or SQL keywords is data, not syntax.
+
+```
+POST /?database=db&output_format=ArrowStream&query_parameters=%5B%7B%22name%22%3A%22%241%22...
+body: SELECT $1 + 1
+```
+
+Each bound row is one parameter set and one execution, for `ExecuteQuery` as much as
+for `ExecuteUpdate` (what `executemany` calls), stopping at the first failure. A
+result-returning execution hands back the last row's result set, there being one
+stream to return. `rows_affected` stays `-1`; the server does not report it here.
+
+Setting `query_parameters` as a *connection* option still works, but a bound
+parameter set overrides it for that request rather than replacing it.
+
+### Parameter types
+
+A parameter's SQL type comes from the JSON type of its value — the format carries no
+type field of its own.
+
+| Bound Arrow type | Sent as | Parameter type |
+|---|---|---|
+| any `NULL` | `null` | untyped `NULL` (`pg_typeof` reports `unknown`) |
+| `bool` | `true` / `false` | `BOOLEAN` |
+| `int8`…`int64`, `uint8`…`uint32` | JSON integer | `BIGINT` |
+| `uint64` | JSON integer | `BIGINT`; above `int64` max, `ADBC_STATUS_INVALID_ARGUMENT` |
+| `float`, `double` | JSON number, always with a fraction | `DOUBLE`; `NaN`/infinity is `ADBC_STATUS_INVALID_ARGUMENT` |
+| `string`, `large_string`, `string_view` | JSON string | `TEXT` |
+| `date32`, `date64` | `"YYYY-MM-DD"` | `TEXT`, coerced |
+| `timestamp` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"`, `+00` when zoned | `TEXT`, coerced |
+| `time32`, `time64` | `"HH:MM:SS[.ffffff]"` | `TEXT`, coerced |
+| `decimal32/64/128/256` | exact digit string, never a JSON number | `TEXT`, coerced |
+| `binary`, `list`, `struct`, `map`, `dictionary`, `interval`, `duration` | — | `ADBC_STATUS_NOT_IMPLEMENTED`, naming the type |
+
+Whole floats keep a `.0` so they stay `DOUBLE`, and doubles print at the shortest
+precision that round-trips. A decimal goes as a string because a JSON number is read
+back through `std::stod`, which would round it.
+
+Where a `TEXT` parameter meets a context that will not coerce it, cast explicitly:
+`$1::DATE`, `$1::DECIMAL(38, 9)`.
+
+### Named parameters
+
+With `adbc.statement.bind_by_name=true` each parameter is *also* carried under its
+bound column's name, which SQL reads through Firebolt's `param()` function.
+`param()` returns `TEXT` whatever was sent, so cast for anything else:
+
+```sql
+SELECT param('who'), param('cutoff')::INT
+```
+
+The Python dbapi layer sets this option for you when you pass a dict.
+
+Both namings are always sent. An unreferenced parameter is ignored by the server, so
+the positional name costs one unused entry and keeps `$N` working when the option is
+stale — which it can be, since a driver manager sends it only when its own idea of it
+changes and the Python layer never revises it once parameters arrive as Arrow data.
+An alias duplicating another parameter's name is dropped (the server rejects
+duplicates); an unnamed column has no alias.
+
+Treat the positional names as that safety net, not as a second way to address a named
+parameter. `$N` is the bound column's ordinal, and for a dict that is the key order of
+the dict — `{"who": …, "cutoff": …}` makes `$1` the value of `who`, and swapping the
+two keys swaps what `$1` means, with no error either way. Use one style per
+statement.
+
+### Parameter metadata
+
+`AdbcStatementPrepare` issues no request: Firebolt has no server-side prepare, so a
+parameterised statement is sent whole every time. `AdbcStatementGetParameterSchema`
+is where the round-trip happens — it re-sends the statement with
+`execution_mode=describe_parameters`, which validates it and reports its placeholder
+types without executing it.
+
+The answer is **not** cached: it depends on the objects the statement names, so DDL
+changes it while the text stays the same, and a driver manager re-issues
+`SetSqlQuery` only on a text change. The cost is one request per call, and the call
+is reached only from `cursor.adbc_prepare()`, never from `execute()`.
+
+That request omits the `transaction_id` and `transaction_sequence_id` session
+parameters — as Firebolt's own PostgreSQL-wire `Describe` does — so type inference
+never spends a transaction step on a statement the caller has not run. It therefore
+cannot see objects created in an open transaction: with autocommit off,
+`adbc_prepare` against a table the same cursor just created reports that the table
+does not exist. Commit first.
+
+The returned schema is a struct with one field per parameter, named `$1`, `$2`, … and
+ordered by ordinal position (by name, `$10` would precede `$2`). An unrecognised type
+becomes Arrow `null` (NA), as ADBC prescribes for an undetermined parameter type.
+Every field is nullable whatever the server reports: a nullability marker there
+describes the column the placeholder was compared against, and `NULL` binds to any
+parameter.
 
 All identifiers — table, catalog, schema, and every column and struct field name
 — are double-quoted with embedded `"` doubled before being interpolated into
@@ -164,6 +271,16 @@ Two nullability rules, both forced by Firebolt:
 | Database | `adbc.firebolt.*` → `ADBC_STATUS_NOT_FOUND`. Any other key is accepted and ignored, because the driver manager sets some itself and callers pass parameters this driver does not consume yet. |
 | Connection | Accepted, and forwarded to the server as a session parameter. |
 | Statement | Accepted and ignored. |
+
+---
+
+## Where this is verified
+
+The behaviour above is pinned against the engine image the integration suite runs
+(`tests/integration/runner.py::DEFAULT_ENGINE_IMAGE`), which accepts
+`query_parameters` and `execution_mode` as ordinary URL query parameters. Neither is
+in the engine's curated public-settings list; a managed SaaS gateway that filters
+non-public settings would need another channel for binding.
 
 ---
 
