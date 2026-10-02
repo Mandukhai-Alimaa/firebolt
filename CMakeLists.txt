@@ -13,7 +13,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(FIREBOLT_ADBC_BUILD_TESTS "Build unit tests" OFF)
 option(FIREBOLT_ADBC_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc into firebolt_adbc" ON)
 option(FIREBOLT_ADBC_STRIP_DEP_DEBUG "Strip debug info from dependency artifacts" ON)
-option(WITH_SSL "Build curl with SSL support via BoringSSL" OFF)
+option(WITH_SSL "Build curl with SSL support via BoringSSL (what ships)" ON)
 
 # All non-system dependencies must live under adbc/submodule.
 set(ADBC_SUBMODULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/submodule" CACHE PATH
@@ -56,10 +56,20 @@ if (WITH_SSL)
     require_dir("${_boringssl_src}" "BoringSSL source submodule")
 endif ()
 
+# Binary size.  Every function and data object gets its own section, here and in
+# every dependency added below, so the link can drop what nothing reaches
+# (--gc-sections on firebolt_adbc).  The version script exports two symbols, so
+# most of BoringSSL, curl and libstdc++ is unreachable.  No effect on speed.
+add_compile_options(-ffunction-sections -fdata-sections)
+
 if (WITH_SSL)
     # Build BoringSSL from source with regular CMake dependency graph wiring.
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Disable BoringSSL shared library build" FORCE)
     set(BUILD_TESTING OFF CACHE BOOL "Disable BoringSSL tests" FORCE)
+    # Drops large precomputed tables (P-256 multiples, among others): about 0.27 MB
+    # smaller, at the cost of slower public-key operations, i.e. a slightly slower
+    # TLS handshake once per connection.  Bulk encryption keeps its AES-NI assembly.
+    set(OPENSSL_SMALL ON CACHE BOOL "Smaller BoringSSL: fewer precomputed tables" FORCE)
     add_subdirectory("${_boringssl_src}" "${_boringssl_build}")
     if (NOT TARGET ssl OR NOT TARGET crypto)
         message(FATAL_ERROR "firebolt_adbc: BoringSSL ssl/crypto static targets were not generated")
@@ -159,6 +169,11 @@ else ()
     unset(OPENSSL_CRYPTO_LIBRARY CACHE)
     unset(OPENSSL_USE_STATIC_LIBS CACHE)
 endif ()
+# No baked-in CA location: configure would record the *build machine's* bundle
+# path, which is wrong on hosts laid out differently.  DatabaseInit picks one at
+# run time instead (src/TlsConfig.h).
+set(CURL_CA_BUNDLE "none" CACHE STRING "No compiled-in CA bundle; chosen at run time" FORCE)
+set(CURL_CA_PATH "none" CACHE STRING "No compiled-in CA directory; chosen at run time" FORCE)
 set(HTTP_ONLY ON CACHE BOOL "Disable non-HTTP protocols in curl" FORCE)
 set(USE_NGHTTP2 OFF CACHE BOOL "Disable HTTP/2 in curl" FORCE)
 set(USE_NGTCP2 OFF CACHE BOOL "Disable HTTP/3 ngtcp2 in curl" FORCE)
@@ -172,6 +187,14 @@ set(CURL_ZLIB OFF CACHE BOOL "Disable zlib support in curl" FORCE)
 set(CURL_BROTLI OFF CACHE BOOL "Disable brotli support in curl" FORCE)
 set(CURL_ZSTD OFF CACHE BOOL "Disable zstd support in curl" FORCE)
 set(CURL_DROP_UNUSED ON CACHE BOOL "Drop unused curl code and data" FORCE)
+# Features the driver never uses.  It sets the Authorization header itself, so
+# none of curl's HTTP auth schemes is needed; ingest uses the MIME API, which
+# stays, not the deprecated curl_formadd API.
+foreach (_curl_unused
+         HTTP_AUTH NTLM KERBEROS_AUTH NEGOTIATE_AUTH DIGEST_AUTH BASIC_AUTH BEARER_AUTH AWS
+         HSTS ALTSVC NETRC FORM_API GETOPTIONS)
+    set(CURL_DISABLE_${_curl_unused} ON CACHE BOOL "Not used by firebolt_adbc" FORCE)
+endforeach ()
 
 # curl's FindCares.cmake consumes these hints when ENABLE_ARES=ON.
 # c-ares generates ares_build.h into its binary dir, while ares.h lives in source include.
@@ -260,6 +283,7 @@ add_library(firebolt_adbc SHARED
     src/IngestSqlBuilder.cpp
     src/QueryParameters.cpp
     src/DescribeParameters.cpp
+    src/TlsConfig.cpp
 )
 
 set_target_properties(firebolt_adbc PROPERTIES
@@ -302,7 +326,19 @@ if (UNIX AND NOT APPLE)
     target_link_options(firebolt_adbc PRIVATE
         -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/firebolt_adbc.version
         -Wl,--as-needed
+        -Wl,--gc-sections
     )
+
+    # lld, when the compiler can use it, also folds identical functions.  Asked of
+    # the compiler rather than set through CMAKE_LINKER, which the compiler driver
+    # ignores when it links.
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-fuse-ld=lld" FIREBOLT_ADBC_HAVE_LLD)
+    if (FIREBOLT_ADBC_HAVE_LLD)
+        target_link_options(firebolt_adbc PRIVATE -fuse-ld=lld -Wl,--icf=all)
+    else ()
+        message(STATUS "firebolt_adbc: lld not available; linking without identical code folding")
+    endif ()
 
     # Print dynamic dependencies after build:
     add_custom_command(TARGET firebolt_adbc POST_BUILD
@@ -336,11 +372,13 @@ if (FIREBOLT_ADBC_BUILD_TESTS)
     add_executable(adbc_driver_tests
         tests/unit/adbc_driver_test.cpp
         tests/unit/session_state_test.cpp
+        tests/unit/tls_config_test.cpp
         src/ArrowIpcStream.cpp
         src/IngestSqlBuilder.cpp
         src/HttpHeaderParse.cpp
         src/QueryParameters.cpp
         src/DescribeParameters.cpp
+        src/TlsConfig.cpp
     )
 
     target_include_directories(adbc_driver_tests PRIVATE
