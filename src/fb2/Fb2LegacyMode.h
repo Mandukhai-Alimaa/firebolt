@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// FB2 SaaS (Legacy) mode. Keep isolated; see CLAUDE.md.
+// FB2 SaaS (Legacy) mode. Keep isolated; see AGENTS.md.
 //
 // Lets the driver reach engines (v5+) deployed in Firebolt 2.0 SaaS:
 // service-account credentials plus account and engine names, exchanged for a
@@ -99,9 +99,10 @@ public:
     // The bearer token for the next request.
     std::string bearerToken();
 
-    // A request was refused with 401.  Drops the cached token and fetches a new
-    // one; true when the caller should retry the request once.
-    bool reauthenticate();
+    // A request carrying `rejected_token` was refused with 401.  Drops that token
+    // and fetches a new one, unless another connection already replaced it; true
+    // when the caller should retry the request once.
+    bool reauthenticate(const std::string & rejected_token);
 
     // Called for every completed response on a connection in FB2 mode.  On
     // success reads Firebolt-Update-Endpoint; on failure may replace

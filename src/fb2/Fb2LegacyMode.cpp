@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// FB2 SaaS (Legacy) mode. Keep isolated; see CLAUDE.md.
+// FB2 SaaS (Legacy) mode. Keep isolated; see AGENTS.md.
 #include "fb2/Fb2LegacyMode.h"
 #include "FireboltUri.h"
+#include "fb2/Fb2TokenClient.h"
 
 #include <map>
 #include <mutex>
@@ -54,7 +55,20 @@ struct Fb2LegacyMode::Impl
 {
     std::mutex mutex;
     std::map<std::string, std::string, std::less<>> option_values; // key → value, as set
+
+    // Resolved by init().
+    Credentials service_account; // empty when a pre-acquired token was given
+    bool token_is_pre_acquired = false; // firebolt.token: never refreshed
+    std::string token_endpoint;
+    bool caching_enabled = true;
+    Transport control_plane_transport;
     std::string bearer_token; // the bearer token in use
+
+    std::string optionOrDefault(std::string_view key, std::string fallback) const
+    {
+        const std::string * value = findOption(key);
+        return value ? *value : fallback;
+    }
 
     // The option's value as set, or nullptr when it was never set.
     const std::string * findOption(std::string_view key) const
@@ -141,9 +155,34 @@ bool Fb2LegacyMode::requested() const
 Status Fb2LegacyMode::init(const InitInputs & inputs, std::string & /*endpoint*/)
 {
     std::lock_guard lock(impl->mutex);
-    if (Status status = impl->validateOptions(inputs); !status.ok())
+    Impl & state = *impl;
+    if (Status status = state.validateOptions(inputs); !status.ok())
         return status;
-    return {ADBC_STATUS_NOT_IMPLEMENTED, "FB2 SaaS mode: connecting is not implemented yet"};
+
+    state.control_plane_transport = {inputs.ca_bundle_path, inputs.timeout_sec};
+    state.caching_enabled = state.optionOrDefault("firebolt.cache_connection", "true") == "true";
+    state.token_endpoint
+        = state.optionOrDefault("firebolt.auth_endpoint", tokenEndpointFor(state.optionOrDefault("firebolt.environment", "app")));
+
+    // Assigned on both branches: an Init retried after a failure may switch from
+    // a pre-acquired token to credentials.
+    state.token_is_pre_acquired = !inputs.token.empty();
+    if (state.token_is_pre_acquired)
+    {
+        state.bearer_token = inputs.token;
+    }
+    else
+    {
+        // validateOptions() guaranteed exactly one spelling of each.
+        state.service_account
+            = {state.optionOrDefault("username", state.optionOrDefault("firebolt.client_id", "")),
+               state.optionOrDefault("password", state.optionOrDefault("firebolt.client_secret", ""))};
+        if (Status status = acquireToken(
+                state.token_endpoint, state.service_account, state.control_plane_transport, state.caching_enabled, state.bearer_token);
+            !status.ok())
+            return status;
+    }
+    return {ADBC_STATUS_NOT_IMPLEMENTED, "FB2 SaaS mode: engine resolution is not implemented yet"};
 }
 
 std::string Fb2LegacyMode::bearerToken()
@@ -152,10 +191,32 @@ std::string Fb2LegacyMode::bearerToken()
     return impl->bearer_token;
 }
 
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static): uses the mode's state once tokens exist (next PR)
-bool Fb2LegacyMode::reauthenticate()
+bool Fb2LegacyMode::reauthenticate(const std::string & rejected_token)
 {
-    return false;
+    // Under the lock, so connections that hit 401 together trigger one exchange
+    // after another rather than racing; the second finds the token it sent
+    // already replaced.
+    std::lock_guard lock(impl->mutex);
+    Impl & state = *impl;
+    if (state.token_is_pre_acquired)
+        return false;
+    if (state.bearer_token != rejected_token)
+        return true; // another connection of this database already refreshed it
+    if (state.caching_enabled)
+    {
+        std::string cached = TokenCache::lookup(state.token_endpoint, state.service_account, std::chrono::steady_clock::now());
+        if (!cached.empty() && cached != rejected_token)
+        {
+            state.bearer_token = cached; // another database already refreshed it
+            return true;
+        }
+        TokenCache::invalidate(state.token_endpoint, state.service_account);
+    }
+    std::string fresh;
+    if (!acquireToken(state.token_endpoint, state.service_account, state.control_plane_transport, state.caching_enabled, fresh).ok())
+        return false;
+    state.bearer_token = fresh;
+    return true;
 }
 
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static): uses the mode's state once engines are resolved
