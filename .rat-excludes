@@ -13,5 +13,5 @@
 # limitations under the License.
 
 # Files that cannot carry the standard header.
-CMakePresets.json
 license.tpl
+pixi.lock
