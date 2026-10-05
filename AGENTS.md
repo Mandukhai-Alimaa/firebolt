@@ -56,7 +56,7 @@ private keys, including test material: generate test certificates at run time.
 │   └── integration/                  # pytest in a runner container (runner.py, conftest.py):
 │                                     #   a 1-node engine, a mock server, or an FB2 SaaS engine
 ├── ci/scripts/                       # adbc-make build, test, and license hooks
-├── scripts/clang-tidy.sh             # clang-tidy through the public dev image
+├── scripts/clang-tidy.sh             # clang-tidy against the generated compile database
 ├── docs/, examples/python/           # user docs and runnable examples
 └── .github/workflows/                # CI (lint, build, tests) and releases
 ```
@@ -164,10 +164,10 @@ Beyond what pre-commit and clang-tidy enforce:
   `adbc_driver_firebolt.exports` export only `AdbcDriverInit` and
   `AdbcDriverFireboltInit`, the name the Foundry's shared-library rules derive from
   the driver name. Windows marks those entry points with `__declspec(dllexport)`.
-- **clang-tidy uses the public build image and `compile_commands.json`** — the build
-  exports the database, and `scripts/clang-tidy.sh` runs `clang-tidy-18` in the
-  `adbc-drivers/dev` manylinux image. Checkout-only pre-commit runs skip the hook
-  until a Linux test build exists; generated build CI invokes it after compilation.
+- **clang-tidy uses the generated `compile_commands.json`** — the build exports the
+  database, and `scripts/clang-tidy.sh` runs `run-clang-tidy-18` from the Linux CI
+  host. Checkout-only pre-commit runs skip the hook until a Linux test build exists;
+  generated build CI invokes it after compilation.
 - **Post-build dependency report** — every build prints concise `DT_NEEDED` `.so` names
   for `libadbc_driver_firebolt.so` so dynamic dependencies are visible in Ninja logs.
 - **SQL injection safety** — `quoteIdentifier()` in `IngestSqlBuilder.cpp` wraps table

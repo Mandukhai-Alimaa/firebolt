@@ -74,8 +74,8 @@ pre-commit run --all-files      # or run them all by hand
 ```
 
 clang-tidy reads the generated Linux test build's `compile_commands.json` and
-runs inside the public `adbc-drivers/dev` image. A checkout-only pre-commit run
-skips it when that build does not exist; generated build CI invokes it after
+runs with `run-clang-tidy-18` from the Linux CI host. A checkout-only pre-commit
+run skips it when that build does not exist; generated build CI invokes it after
 compilation. Its checks, in `.clang-tidy`, treat every warning as an error.
 
 A file that cannot carry a header (JSON) is listed in `.rat-excludes`; a file

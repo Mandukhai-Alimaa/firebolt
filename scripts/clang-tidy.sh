@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run clang-tidy from the public adbc-drivers/dev manylinux image against the
-# compile database produced by the generated Linux test build. A checkout-only
+# Run clang-tidy against the compile database produced by the generated Linux
+# test build. GitHub's Ubuntu runner provides clang-tidy 18. A checkout-only
 # pre-commit run has no compile database and skips this hook; generated build CI
 # invokes it after compilation.
 set -euo pipefail
@@ -28,23 +28,23 @@ if [[ ! -f "$build_dir/compile_commands.json" ]]; then
   exit 0
 fi
 
-image="${ADBC_DEV_IMAGE:-ghcr.io/adbc-drivers/dev:manylinux_2_28-cpp1.27.1}"
+runner="${RUN_CLANG_TIDY:-run-clang-tidy-18}"
+if ! command -v "$runner" >/dev/null 2>&1; then
+  printf '%s is missing; install clang-tidy 18 or set RUN_CLANG_TIDY\n' "$runner" >&2
+  exit 1
+fi
+
 files=()
 for file in "$@"; do
   case "$file" in
-    *.cpp) files+=("/source/$file") ;;
+    *.cpp) files+=("$repo_root/$file") ;;
     *) files=(); break ;;
   esac
 done
 if [[ ${#files[@]} -eq 0 ]]; then
-  files=("/source/(src|tests/unit)/.*\\.cpp")
+  files=("$repo_root/(src|tests/unit)/.*\\.cpp")
 fi
 
-docker run --rm \
-  -u "$(id -u):$(id -g)" \
-  -v "$repo_root:/source" \
-  -w /source \
-  "$image" \
-  run-clang-tidy-18 -p "/source/$build_dir" -quiet \
-    -header-filter='^/source/(src|tests/unit)/' \
-    "${files[@]}"
+"$runner" -p "$build_dir" -quiet \
+  -header-filter="^$repo_root/(src|tests/unit)/" \
+  "${files[@]}"
