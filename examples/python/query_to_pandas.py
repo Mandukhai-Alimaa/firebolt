@@ -22,15 +22,17 @@ Configure with FIREBOLT_ADBC_DRIVER / FIREBOLT_URI — see examples/python/READM
 
 import argparse
 import os
+import sys
 
 from adbc_driver_manager import dbapi
 
+DRIVER_EXTENSION = {"darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
 DEFAULT_DRIVER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
     "..",
     "build",
-    "libadbc_driver_firebolt.so",
+    f"libadbc_driver_firebolt{DRIVER_EXTENSION}",
 )
 
 
