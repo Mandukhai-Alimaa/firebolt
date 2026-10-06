@@ -21,7 +21,6 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 license_files=(
   "LICENSE.txt"
   "license.tpl"
-  "submodule/nanoarrow/NOTICE.txt"
   "submodule/nanoarrow/LICENSE.txt"
   "submodule/boringssl/LICENSE"
   "submodule/boringssl/third_party/fiat/LICENSE"
@@ -54,7 +53,6 @@ cat "${repo_root}/license.tpl"
 
 append_component \
   "Apache Arrow nanoarrow" \
-  "submodule/nanoarrow/NOTICE.txt" \
   "submodule/nanoarrow/LICENSE.txt"
 append_component "BoringSSL" "submodule/boringssl/LICENSE"
 append_component \
