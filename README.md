@@ -53,19 +53,13 @@ Takes about two minutes and needs Docker plus Python 3.9+.
 pip install adbc-driver-manager pyarrow
 ```
 
-**2. Download the driver**
+**2. Install the driver**
 
-Download the package matching your platform and architecture from the
-[latest release](https://github.com/adbc-drivers/firebolt/releases/latest). For
-example, on Linux x86_64:
+Install [dbc](https://docs.columnar.tech/dbc), then install the Firebolt driver:
 
 ```bash
-gh release download --repo adbc-drivers/firebolt --pattern 'firebolt_linux_amd64_*.tar.gz'
-tar -xzf firebolt_linux_amd64_*.tar.gz
+dbc install firebolt --pre
 ```
-
-Keep the file name as it is: a driver manager derives the entry point
-`AdbcDriverFireboltInit` from it.
 
 **3. Start a Firebolt engine**
 
@@ -87,7 +81,7 @@ curl -fsS http://localhost:3473/ping && echo ok
 import adbc_driver_manager.dbapi as dbapi
 
 with dbapi.connect(
-    driver="./libadbc_driver_firebolt.so",
+    driver="firebolt",
     db_kwargs={"uri": "http://localhost:3473"},
 ) as conn:
     with conn.cursor() as cur:
