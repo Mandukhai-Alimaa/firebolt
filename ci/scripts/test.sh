@@ -37,8 +37,6 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 
 build_dir="${repo_root}/build/ci-test-${platform}-${arch}"
 
-export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-/tmp/adbc-driver-firebolt-pixi-cache}"
-
 ctest=(ctest)
 if command -v pixi >/dev/null 2>&1; then
   ctest=(pixi exec -s cmake ctest)

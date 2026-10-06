@@ -26,10 +26,10 @@ arch="$3"
 
 case "$mode" in
   test)
-    cmake_config="Debug"
+    export CMAKE_BUILD_TYPE="Debug"
     ;;
   release)
-    cmake_config="Release"
+    export CMAKE_BUILD_TYPE="Release"
     ;;
   *)
     printf 'unsupported build mode: %s\n' "$mode" >&2
@@ -67,8 +67,6 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 build_dir="${repo_root}/build/ci-${mode}-${platform}-${arch}"
 output_library="${repo_root}/build/libadbc_driver_firebolt.${library_ext}"
 
-export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-/tmp/adbc-driver-firebolt-pixi-cache}"
-
 cmake=(cmake)
 generator_args=()
 if command -v pixi >/dev/null 2>&1; then
@@ -83,7 +81,6 @@ fi
 configure_args=(
   -S "$repo_root"
   -B "$build_dir"
-  -DCMAKE_BUILD_TYPE="$cmake_config"
   -DFIREBOLT_ADBC_BUILD_TESTS=ON
   -DWITH_SSL=ON
 )
@@ -98,7 +95,7 @@ elif [[ "$platform" == "windows" ]]; then
   )
 fi
 
-build_args=(--build "$build_dir" --config "$cmake_config" --parallel)
+build_args=(--build "$build_dir" --config "$CMAKE_BUILD_TYPE" --parallel)
 
 case "${CMAKE_VERBOSE:-}" in
   1 | ON | TRUE | true | yes | YES)

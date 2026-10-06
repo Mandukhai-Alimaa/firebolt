@@ -215,7 +215,7 @@ jobs:
             source .env.release
           fi
           set +a
-          pixi run adbc-make check CI=true VERBOSE=true TOOLCHAIN=cpp MANYLINUX=manylinux_2_28 RELEASE=true
+          pixi run adbc-make check CI=true VERBOSE=true  RELEASE=true
           if [[ -f ci/scripts/post-build.sh ]]; then
             ./ci/scripts/post-build.sh release ${{ matrix.platform }} ${{ matrix.arch }}
           fi
