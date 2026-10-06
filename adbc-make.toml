@@ -18,9 +18,3 @@ manylinux = "manylinux_2_28"
 [lang]
 lang = "script"
 toolchain = "cpp"
-
-[additional-runtime-dependencies]
-macos = [
-  "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices",
-  "/usr/lib/libc++.1.dylib",
-]
